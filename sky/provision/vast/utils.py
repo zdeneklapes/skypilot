@@ -144,8 +144,8 @@ def launch(name: str,
            preemptible: bool,
            secure_only: bool,
            reliable_hosts: bool = False,
-           network_tier: resources_utils.NetworkTier =
-           resources_utils.NetworkTier.STANDARD,
+           network_tier: resources_utils.NetworkTier = resources_utils.
+           NetworkTier.STANDARD,
            excluded_machine_ids: Optional[List[Any]] = None,
            private_docker_registry: Optional[bool] = None,
            login: Optional[str] = None,
