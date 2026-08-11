@@ -35,6 +35,30 @@ def test_v1_queue_handler_defaults_to_lightweight_fields():
         managed_job_constants.DEFAULT_MANAGED_JOB_FIELDS)
 
 
+def test_queue_v2_api_returns_selected_exit_codes():
+    """Selecting exit_codes returns it while omitting unrequested fields."""
+    job = {
+        'job_id': 1,
+        'task_id': 0,
+        'status': managed_job_state.ManagedJobStatus.FAILED,
+        'exit_codes': [137, 23],
+        'failure_reason': 'must stay unselected',
+    }
+    with mock.patch.object(jobs_core,
+                           'queue_v2',
+                           return_value=([job], 1, {
+                               'FAILED': 1
+                           }, 1)):
+        records, total, status_counts, total_no_filter = (
+            jobs_core.queue_v2_api(refresh=False, fields=['exit_codes']))
+
+    assert records[0].exit_codes == [137, 23]
+    assert 'failure_reason' not in records[0].model_fields_set
+    assert total == 1
+    assert status_counts == {'FAILED': 1}
+    assert total_no_filter == 1
+
+
 def _make_job(job_id: int,
               user_name: Optional[str] = 'alice',
               workspace: Optional[str] = 'ws',
