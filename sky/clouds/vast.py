@@ -223,6 +223,20 @@ class Vast(clouds.Cloud):
             default_value={},
             override_configs=resources.cluster_config_overrides,
         )
+        reliable_hosts = skypilot_config.get_effective_region_config(
+            cloud='vast',
+            region=region.name,
+            keys=('reliable_hosts',),
+            default_value=False,
+            override_configs=resources.cluster_config_overrides,
+        )
+        provision_timeout = skypilot_config.get_effective_region_config(
+            cloud='vast',
+            region=region.name,
+            keys=('provision_timeout',),
+            default_value=30 * 60,
+            override_configs=resources.cluster_config_overrides,
+        )
 
         return {
             'instance_type': resources.instance_type,
@@ -230,6 +244,8 @@ class Vast(clouds.Cloud):
             'region': region.name,
             'image_id': image_id,
             'secure_only': secure_only,
+            'reliable_hosts': reliable_hosts,
+            'provision_timeout': provision_timeout,
             'create_instance_kwargs': create_instance_kwargs or {},
         }
 
@@ -262,47 +278,52 @@ class Vast(clouds.Cloud):
             False,
             override_configs=resources.cluster_config_overrides)
 
-        # Currently, handle a filter on accelerators only.
-        accelerators = resources.accelerators
-        if accelerators is None:
-            # Return a default instance type
-            default_instance_type = Vast.get_default_instance_type(
-                cpus=resources.cpus,
-                memory=resources.memory,
-                disk_tier=resources.disk_tier,
-                local_disk=resources.local_disk,
-                region=resources.region,
-                zone=resources.zone,
-                use_spot=resources.use_spot,
-                max_hourly_cost=resources.max_hourly_cost,
-                datacenter_only=datacenter_only)
-            if default_instance_type is None:
-                # TODO: Add hints to all return values in this method to help
-                #  users understand why the resources are not launchable.
-                return resources_utils.FeasibleResources([], [], None)
-            else:
+        try:
+            # Currently, handle a filter on accelerators only.
+            accelerators = resources.accelerators
+            if accelerators is None:
+                # Return a default instance type
+                default_instance_type = Vast.get_default_instance_type(
+                    cpus=resources.cpus,
+                    memory=resources.memory,
+                    disk_tier=resources.disk_tier,
+                    local_disk=resources.local_disk,
+                    region=resources.region,
+                    zone=resources.zone,
+                    use_spot=resources.use_spot,
+                    max_hourly_cost=resources.max_hourly_cost,
+                    datacenter_only=datacenter_only)
+                if default_instance_type is None:
+                    return resources_utils.FeasibleResources([], [], None)
                 return resources_utils.FeasibleResources(
                     _make([default_instance_type]), [], None)
 
-        assert len(accelerators) == 1, resources
-        acc, acc_count = list(accelerators.items())[0]
-        (instance_list,
-         fuzzy_candidate_list) = vast_catalog.get_instance_type_for_accelerator(
-             acc,
-             acc_count,
-             use_spot=resources.use_spot,
-             cpus=resources.cpus,
-             local_disk=resources.local_disk,
-             region=resources.region,
-             zone=resources.zone,
-             memory=resources.memory,
-             max_hourly_cost=resources.max_hourly_cost,
-             datacenter_only=datacenter_only)
-        if instance_list is None:
-            return resources_utils.FeasibleResources([], fuzzy_candidate_list,
-                                                     None)
-        return resources_utils.FeasibleResources(_make(instance_list),
-                                                 fuzzy_candidate_list, None)
+            assert len(accelerators) == 1, resources
+            acc, acc_count = list(accelerators.items())[0]
+            (instance_list, fuzzy_candidate_list
+            ) = vast_catalog.get_instance_type_for_accelerator(
+                acc,
+                acc_count,
+                use_spot=resources.use_spot,
+                cpus=resources.cpus,
+                local_disk=resources.local_disk,
+                region=resources.region,
+                zone=resources.zone,
+                memory=resources.memory,
+                max_hourly_cost=resources.max_hourly_cost,
+                datacenter_only=datacenter_only)
+            if instance_list is None:
+                return resources_utils.FeasibleResources([],
+                                                         fuzzy_candidate_list,
+                                                         None)
+            return resources_utils.FeasibleResources(_make(instance_list),
+                                                     fuzzy_candidate_list, None)
+        except Exception as exc:  # pylint: disable=broad-except
+            from sky.catalog import common as catalog_common
+            if not isinstance(exc, catalog_common.CatalogFetchError):
+                raise
+            return resources_utils.FeasibleResources(
+                [], [], f'Vast catalog is unavailable: {exc}')
 
     @classmethod
     def _check_compute_credentials(
@@ -319,7 +340,6 @@ class Vast(clouds.Cloud):
             return False, (
                 'error \n'  # First line is indented by 4 spaces
                 '    Credentials can be set up by running: \n'
-                '        $ pip install vastai\n'
                 '        $ mkdir -p ~/.config/vastai\n'
                 f'        $ echo [key] > {_CREDENTIAL_PATH}\n'
                 '    For more information, see https://docs.skypilot.co/en/latest/getting-started/installation.html#vast'  # pylint: disable=line-too-long
