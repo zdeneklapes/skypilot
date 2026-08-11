@@ -237,6 +237,8 @@ class Vast(clouds.Cloud):
             default_value=30 * 60,
             override_configs=resources.cluster_config_overrides,
         )
+        network_tier = (resources.network_tier or
+                        resources_utils.NetworkTier.STANDARD)
 
         return {
             'instance_type': resources.instance_type,
@@ -247,6 +249,7 @@ class Vast(clouds.Cloud):
             'reliable_hosts': reliable_hosts,
             'provision_timeout': provision_timeout,
             'create_instance_kwargs': create_instance_kwargs or {},
+            'network_tier': network_tier.value,
         }
 
     def _get_feasible_launchable_resources(
