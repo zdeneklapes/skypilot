@@ -304,6 +304,12 @@ if sys.version_info >= (3, 12):
     # that require ray.
     clouds_for_all -= set(clouds_with_ray)
 
+# Vast 1.5 requires cryptography==49, while the supported Azure CLI releases
+# require cryptography<49.  Server images that need Vast therefore use this
+# profile instead of the Azure-capable ``all`` profile.
+clouds_for_all_except_azure = clouds_for_all | {'vast'}
+clouds_for_all_except_azure.remove('azure')
+
 cloud_extras = {
     cloud: dependencies + server_dependencies
     for cloud, dependencies in cloud_dependencies.items()
@@ -314,6 +320,8 @@ extras_require: Dict[str, List[str]] = {
     **cloud_extras,
     'all': list(set().union(*[cloud_extras[cloud] for cloud in clouds_for_all])
                ),
+    'all-except-azure': list(set().union(
+        *[cloud_extras[cloud] for cloud in clouds_for_all_except_azure])),
     'remote': remote,
     'server': server_dependencies,
 }

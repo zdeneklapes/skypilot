@@ -82,6 +82,9 @@ RUN cd /skypilot && \
 FROM python:3.10.19-slim
 
 ARG INSTALL_FROM_SOURCE=true
+# Azure CLI and Vast 1.5 require incompatible cryptography versions.  The
+# server image defaults to the profile that includes Vast and omits Azure.
+ARG SKYPILOT_INSTALL_EXTRAS=all-except-azure
 
 # Copy Google Cloud SDK from Stage 1
 COPY --from=gcloud-apt-install /usr/lib/google-cloud-sdk /opt/google-cloud-sdk
@@ -128,9 +131,6 @@ RUN ARCH=${TARGETARCH:-$(case "$(uname -m)" in \
 RUN curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh | NEBIUS_INSTALL_FOLDER=/usr/local/bin bash
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    # Cap azure-cli<2.87.0: 2.87.0 pulls the broken azure-mgmt-storage 25.0.0
-    # (see sky/setup_files/dependencies.py).
-    ~/.local/bin/uv pip install --prerelease allow "azure-cli<2.87.0" --system && \
     # Upgrade setuptools in base image to mitigate CVE-2024-6345
     ~/.local/bin/uv pip install --system --upgrade setuptools==78.1.1 && \
     ~/.local/bin/uv cache clean && \
@@ -146,7 +146,7 @@ COPY --from=process-source /image-tools/ /usr/local/bin/
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
         echo "Installing from source in editable mode" && \
-        ~/.local/bin/uv pip install -e ".[all]" --system; \
+        ~/.local/bin/uv pip install -e ".[${SKYPILOT_INSTALL_EXTRAS}]" --system; \
     else \
         echo "Installing from wheel file" && \
         WHEEL_FILE=$(ls dist/*skypilot*.whl 2>/dev/null | head -1) && \
@@ -155,7 +155,7 @@ RUN cd /skypilot && \
             ls -la /skypilot/dist/ && \
             exit 1; \
         fi && \
-        ~/.local/bin/uv pip install "${WHEEL_FILE}[all]" --system && \
+        ~/.local/bin/uv pip install "${WHEEL_FILE}[${SKYPILOT_INSTALL_EXTRAS}]" --system && \
         echo "Skipping dashboard build for wheel installation"; \
     fi && \
     # Cleanup all caches to reduce the image size
