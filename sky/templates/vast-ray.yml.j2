@@ -14,7 +14,6 @@ provider:
   reliable_hosts: {{reliable_hosts}}
   network_tier: {{network_tier}}
   provision_timeout: {{provision_timeout}}
-  network_tier: {{network_tier}}
   # Vast pulls the runtime image during instance creation. Keep registry
   # credentials in provider config to avoid the nested Docker initializer.
   {%- if docker_login_config is not none %}
