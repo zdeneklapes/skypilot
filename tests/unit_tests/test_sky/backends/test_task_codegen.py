@@ -324,6 +324,7 @@ class TestRcloneFlushScript:
         ('bash -c "exit 0"', 0),
         ('bash -c "exit 1"', 1),
         ('bash -c "exit 2"', 2),
+        ('bash -c "exit 42"', 42),
         ('python3 -c "import sys; sys.exit(0)"', 0),
         ('python3 -c "import sys; sys.exit(1)"', 1),
     ])
