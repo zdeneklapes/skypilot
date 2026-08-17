@@ -172,7 +172,7 @@ MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '40'  # Structured managed job exit codes.
+SKYLET_VERSION = '41'  # Durable provider-aware autodown contract.
 # Skylet v40 is the first controller running managed-jobs API v23.
 MIN_MANAGED_JOB_EXIT_CODES_SKYLET_VERSION = 40
 # The version of the lib files that skylet/jobs use. Whenever there is an API
