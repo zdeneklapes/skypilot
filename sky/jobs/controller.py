@@ -2650,12 +2650,13 @@ class JobController:
                     managed_job_state.ManagedJobStatus.RUNNING):
                 return False
             await asyncio.to_thread(self._load_dag)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # pylint: disable=try-except-raise
             raise
         except Exception as reattach_error:  # pylint: disable=broad-except
+            formatted_error = common_utils.format_exception(reattach_error)
             logger.warning(
                 'Could not establish a safe reattachment after an unexpected '
-                f'controller error: {common_utils.format_exception(reattach_error)}. '
+                f'controller error: {formatted_error}. '
                 'Using bounded emergency recovery instead.')
             return False
 
@@ -2664,9 +2665,10 @@ class JobController:
         # resumes observation without force_transit_to_recovering.
         self._emergency_backoff_seconds = (
             jobs_constants.EMERGENCY_RECOVERY_BACKOFF_BASE_SECONDS)
+        formatted_error = common_utils.format_exception(error, use_bracket=True)
         logger.warning(
-            f'Controller error {common_utils.format_exception(error, use_bracket=True)} '
-            f'while task {task_id} is still RUNNING. Reattaching to the '
+            f'Controller error {formatted_error} while task {task_id} is '
+            'still RUNNING. Reattaching to the '
             'existing workload after a monitoring backoff.')
         return True
 
