@@ -63,7 +63,8 @@ COPY . /skypilot
 
 RUN cd /skypilot && \
     install -d -m 0755 /image-tools && \
-    install -m 0755 scripts/refresh-runpod-catalog.py /image-tools/refresh-runpod-catalog.py
+    install -m 0755 scripts/refresh-runpod-catalog.py /image-tools/refresh-runpod-catalog.py && \
+    install -m 0755 scripts/refresh-vast-catalog.py /image-tools/refresh-vast-catalog.py
 
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" != "true" ]; then \
