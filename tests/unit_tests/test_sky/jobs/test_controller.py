@@ -1675,7 +1675,11 @@ class TestDegradedJobStatusMonitoring:
         relaunching a workload whose remote terminal state is unconfirmed.
         """
         monkeypatch.setattr(managed_job_utils,
-                            'JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS', 60)
+                            'JOB_STATUS_FETCH_MIN_ELAPSED_SECONDS', 60)
+        # This test is about the reset, not the retry budget: drop the retry
+        # budget so the time budget alone decides when the window is spent.
+        monkeypatch.setattr(managed_job_utils, 'JOB_STATUS_FETCH_MIN_RETRIES',
+                            0)
         monkeypatch.setattr(managed_job_utils, 'JOB_STATUS_CHECK_GAP_SECONDS',
                             0)
 

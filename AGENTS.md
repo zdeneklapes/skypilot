@@ -118,6 +118,7 @@ From `requirements-dev.txt`:
 
 - Run every test, formatter, linter, type check, build check, and other code-quality validation inside Docker.
 - Always build and use the Docker image from `tests/smoke_tests/docker/Dockerfile_test` for that validation.
+- This applies to every project test suite, including unit, smoke, integration, dashboard, and provider-specific suites.
 - The Docker image must contain all tools and dependencies required for the validation; install them in the image rather than relying on host-installed tools.
 - Do not run validation directly on the host or use another image. If the Docker daemon is unavailable, report the environment blocker instead of substituting host commands.
 
