@@ -248,7 +248,7 @@ def test_refresh_catalog_skips_without_vast_credential_file(monkeypatch):
 
 
 def test_refresh_catalog_force_bypasses_fresh_catalog(monkeypatch, tmp_path):
-    """A feasibility retry refreshes even a valid catalog inside its age window."""
+    """A feasibility retry refreshes a valid catalog inside its age window."""
     catalog_path = tmp_path / 'vast' / 'vms.csv'
     catalog_path.parent.mkdir()
     _write_catalog(catalog_path)

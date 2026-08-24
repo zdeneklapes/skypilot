@@ -276,6 +276,7 @@ _REQUEST_BODY_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
     'sky.expired-token-cleanup': (),
     'sky.autodown-reconciler': (),
     'sky.runpod-catalog-refresh': (),
+    'sky.vast-catalog-refresh': (),
     # Category 2: redact task/dag YAML fields before including
     'sky.launch': ('task',),
     'sky.exec': ('task',),
