@@ -117,7 +117,11 @@ machine advance. "Running" at the provider layer does not imply a running job.
   transitional state (bounded by ``vast.provision_timeout``), and requires
   ``actual_status == running`` plus a head instance. Vast's agent runs the
   SkyPilot bootstrap via the offer's onstart script, independent of the image
-  entrypoint.
+  entrypoint. Feasibility uses the same targeted live-offer requirements:
+  unscoped tasks use the internal ``any`` placement sentinel, while an explicit
+  region remains a country constraint. Stable catalog regions and prices are
+  advisory metadata only; an unscoped no-match forces one catalog refresh and
+  retries once before the capacity diagnostic is returned.
 
 After instance readiness, SkyPilot must reach the container over SSH with the
 injected key and start its runtime (Ray and skylet); only then is the cluster
