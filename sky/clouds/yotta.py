@@ -216,10 +216,11 @@ class Yotta(clouds.Cloud):
         custom_resources = resources_utils.make_ray_custom_resources_str(
             acc_dict)
 
-        if resources.image_id is None:
-            image_id: Optional[str] = _BASE_IMAGE
-        elif resources.extract_docker_image() is not None:
-            image_id = resources.extract_docker_image()
+        docker_image = resources.extract_docker_image()
+        if docker_image is not None:
+            image_id: Optional[str] = docker_image
+        elif resources.image_id is None:
+            image_id = _BASE_IMAGE
         else:
             image_id = resources.image_id[resources.region]
 
