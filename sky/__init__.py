@@ -136,6 +136,7 @@ from sky.data import StorageMode
 from sky.data import StoreType
 from sky.jobs import ManagedJobStatus
 from sky.optimizer import Optimizer
+from sky.resources import ResolvedCloudOffer
 from sky.resources import Resources
 from sky.server.requests.request_names import AdminPolicyRequestName
 from sky.skylet.job_lib import JobStatus
@@ -218,6 +219,7 @@ __all__ = [
     'DagExecution',
     'Task',
     'Resources',
+    'ResolvedCloudOffer',
     # core APIs
     'optimize',
     'launch',

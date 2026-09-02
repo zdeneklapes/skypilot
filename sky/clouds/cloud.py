@@ -317,6 +317,28 @@ class Cloud:
         """
         raise NotImplementedError
 
+    def zones_provision_loop_for_resources(
+        self,
+        resources: 'resources_lib.Resources',
+        *,
+        region: str,
+        num_nodes: int,
+    ) -> Iterator[Optional[List[Zone]]]:
+        """Return live provisioning zones for a concrete resource request.
+
+        Clouds with provider-resolved offers may override this hook to use the
+        offer's immutable scheduling data while resolving only live capacity.
+        The default preserves the legacy instance-type catalog behavior.
+        """
+        assert resources.instance_type is not None, resources
+        return self.zones_provision_loop(region=region,
+                                         num_nodes=num_nodes,
+                                         instance_type=resources.instance_type,
+                                         accelerators=typing.cast(
+                                             Optional[Dict[str, int]],
+                                             resources.accelerators),
+                                         use_spot=resources.use_spot)
+
     @classmethod
     def get_zone_shell_cmd(cls) -> Optional[str]:
         """Returns the shell command to obtain the zone of instance."""

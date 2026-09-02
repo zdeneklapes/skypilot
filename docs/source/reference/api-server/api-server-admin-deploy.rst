@@ -517,6 +517,14 @@ Following tabs describe how to configure credentials for different clouds on the
         Cloud, and GPU-count configuration: only data centers reporting
         ``LOW``, ``MEDIUM``, or ``HIGH`` availability are included. This is
         neither a permanent offering guarantee nor a capacity reservation.
+        A caller may attach a versioned resolved RunPod offer to internal task
+        metadata after selecting one of these rows. Managed-jobs controllers
+        bind that offer to the exact matching resource after each YAML round
+        trip and use its immutable hardware and price fields without requiring
+        the same row in their local CSV catalog. Malformed or resource-mismatched
+        offers are rejected, while tasks without an offer keep the normal
+        catalog-backed behavior.
+
         The scheduler repeats the exact live availability check immediately
         before selecting a zone, and provisioning performs one final
         force-refreshed check before creating a pod. If refresh fails, the API
@@ -525,6 +533,11 @@ Following tabs describe how to configure credentials for different clouds on the
         interval, set
         ``daemons.runpod-catalog-refresh-daemon.interval_seconds`` in the
         SkyPilot server configuration.
+
+        Deploy the same SkyPilot revision to the API server and managed-jobs
+        controller. Existing cached controllers run their previous code and
+        ignore resolved-offer metadata, so recreate the controller after the
+        upgrade before relying on catalog-independent managed-job recovery.
 
         .. dropdown:: Use existing RunPod credentials
 

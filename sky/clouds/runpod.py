@@ -95,6 +95,21 @@ class RunPod(clouds.Cloud):
         resources: Optional['resources_lib.Resources'] = None,
     ) -> List[clouds.Region]:
         del accelerators  # unused
+        if (resources is not None and
+                resources.resolved_cloud_offer is not None):
+            offer = resources.resolved_cloud_offer
+            if offer.provider.lower() != 'runpod':
+                raise ValueError(
+                    'RunPod resources can only use a RunPod resolved cloud '
+                    'offer.')
+            if region is not None and region != offer.region:
+                raise ValueError(
+                    'Resolved RunPod offer region does not match the '
+                    'requested region.')
+            # Data-center inventory is live state and must not be carried from
+            # selection. The provisioning loop resolves it immediately before
+            # creating a pod.
+            return [clouds.Region(offer.region).set_zones([])]
         regions = catalog.get_region_zones_for_instance_type(
             instance_type, use_spot, 'runpod')
 
@@ -151,6 +166,34 @@ class RunPod(clouds.Cloud):
         for r in regions:
             assert r
             yield r.zones
+
+    def zones_provision_loop_for_resources(
+        self,
+        resources: 'resources_lib.Resources',
+        *,
+        region: str,
+        num_nodes: int,
+    ) -> Iterator[Optional[List['clouds.Zone']]]:
+        """Resolve only live data centers for a selected RunPod offer."""
+        offer = resources.resolved_cloud_offer
+        if offer is None:
+            yield from super().zones_provision_loop_for_resources(
+                resources, region=region, num_nodes=num_nodes)
+            return
+        if offer.provider.lower() != 'runpod':
+            raise ValueError('RunPod resources can only use a RunPod resolved '
+                             'cloud offer.')
+        if region != offer.region:
+            raise ValueError('Resolved RunPod offer region does not match the '
+                             'requested region.')
+        available = (
+            runpod_sdk_adaptor.available_data_center_ids_for_instance_type(
+                offer.instance_type, [region], force_refresh=True))
+        if available is None:
+            return
+        zones = [clouds.Zone(name=zone_name) for zone_name in sorted(available)]
+        if zones:
+            yield zones
 
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
@@ -229,8 +272,23 @@ class RunPod(clouds.Cloud):
         zone_names = [zone.name for zone in zones]
 
         resources = resources.assert_launchable()
-        acc_dict = self.get_accelerators_from_instance_type(
-            resources.instance_type)
+        offer = resources.resolved_cloud_offer
+        acc_dict: Optional[Dict[str, Union[int, float]]]
+        if offer is not None:
+            if offer.provider.lower() != 'runpod':
+                raise ValueError(
+                    'RunPod resources can only use a RunPod resolved cloud '
+                    'offer.')
+            if region.name != offer.region:
+                raise ValueError(
+                    'Resolved RunPod offer region does not match the '
+                    'deployment region.')
+            acc_dict = {
+                offer.accelerator_name: offer.accelerator_count,
+            }
+        else:
+            acc_dict = self.get_accelerators_from_instance_type(
+                resources.instance_type)
         custom_resources = resources_utils.make_ray_custom_resources_str(
             acc_dict)
 
@@ -244,8 +302,11 @@ class RunPod(clouds.Cloud):
 
         instance_type = resources.instance_type
         use_spot = resources.use_spot
-        hourly_cost = self.instance_type_to_hourly_cost(
-            instance_type=instance_type, use_spot=use_spot)
+        if offer is not None:
+            hourly_cost = offer.hourly_price
+        else:
+            hourly_cost = self.instance_type_to_hourly_cost(
+                instance_type=instance_type, use_spot=use_spot)
         network_tier = (resources.network_tier or
                         resources_utils.NetworkTier.STANDARD)
 
@@ -272,6 +333,8 @@ class RunPod(clouds.Cloud):
         self, resources: 'resources_lib.Resources'
     ) -> 'resources_utils.FeasibleResources':
         """Returns a list of feasible resources for the given resources."""
+        if resources.resolved_cloud_offer is not None:
+            return resources_utils.FeasibleResources([resources], [], None)
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             resources = resources.copy(accelerators=None)

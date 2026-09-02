@@ -1,11 +1,14 @@
 """Resources: compute requirements of Tasks."""
 import collections
+import collections.abc
 import dataclasses
+import math
 import re
 import sys
 import textwrap
 import typing
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import (Any, Dict, List, Literal, Mapping, Optional, Set, Tuple,
+                    Union)
 
 import colorama
 
@@ -40,6 +43,119 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 DEFAULT_DISK_SIZE_GB = 256
+
+RESOLVED_CLOUD_OFFER_SCHEMA_VERSION = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedCloudOffer:
+    """Immutable provider offer selected before a managed job is submitted.
+
+    The offer deliberately contains only the normalized scheduling attributes
+    needed after submission. In particular it must not carry provider
+    credentials, raw provider responses, or cached availability zones.
+    """
+
+    provider: str
+    instance_type: str
+    region: str
+    accelerator_name: str
+    accelerator_count: int
+    cpu_count: float
+    memory_gib: float
+    device_memory_gib: float
+    hourly_price: float
+    use_spot: bool
+    schema_version: int = RESOLVED_CLOUD_OFFER_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.schema_version, int) or
+                isinstance(self.schema_version, bool) or
+                self.schema_version != RESOLVED_CLOUD_OFFER_SCHEMA_VERSION):
+            raise ValueError('Unsupported resolved cloud offer schema version: '
+                             f'{self.schema_version!r}.')
+        for field_name in ('provider', 'instance_type', 'region',
+                           'accelerator_name'):
+            value = getattr(self, field_name)
+            if (not isinstance(value, str) or not value or
+                    value != value.strip()):
+                raise ValueError(
+                    f'Resolved cloud offer {field_name} must be a non-empty '
+                    'trimmed string.')
+        if (not isinstance(self.accelerator_count, int) or
+                isinstance(self.accelerator_count, bool) or
+                self.accelerator_count <= 0):
+            raise ValueError(
+                'Resolved cloud offer accelerator_count must be a positive '
+                'integer.')
+        for field_name in ('cpu_count', 'memory_gib', 'device_memory_gib'):
+            value = getattr(self, field_name)
+            if (not isinstance(value,
+                               (int, float)) or isinstance(value, bool) or
+                    not math.isfinite(value) or value <= 0):
+                raise ValueError(
+                    f'Resolved cloud offer {field_name} must be a positive '
+                    'finite number.')
+        if (not isinstance(self.hourly_price, (int, float)) or
+                isinstance(self.hourly_price, bool) or
+                not math.isfinite(self.hourly_price) or self.hourly_price < 0):
+            raise ValueError(
+                'Resolved cloud offer hourly_price must be a non-negative '
+                'finite number.')
+        if not isinstance(self.use_spot, bool):
+            raise ValueError('Resolved cloud offer use_spot must be a bool.')
+
+    @classmethod
+    def from_json_mapping(cls, mapping: Mapping[str,
+                                                Any]) -> 'ResolvedCloudOffer':
+        """Parse the versioned transport mapping and reject unknown fields."""
+        if not isinstance(mapping, collections.abc.Mapping):
+            raise ValueError('Resolved cloud offer must be a JSON mapping.')
+        if any(not isinstance(key, str) for key in mapping):
+            raise ValueError(
+                'Resolved cloud offer mapping keys must be strings.')
+        expected_fields = {
+            'schema_version',
+            'provider',
+            'instance_type',
+            'region',
+            'accelerator_name',
+            'accelerator_count',
+            'cpu_count',
+            'memory_gib',
+            'device_memory_gib',
+            'hourly_price',
+            'use_spot',
+        }
+        keys = set(mapping)
+        if keys != expected_fields:
+            missing = sorted(expected_fields - keys)
+            unexpected = sorted(keys - expected_fields)
+            details = []
+            if missing:
+                details.append(f'missing={missing}')
+            if unexpected:
+                details.append(f'unexpected={unexpected}')
+            raise ValueError('Malformed resolved cloud offer mapping (' +
+                             ', '.join(details) + ').')
+        return cls(**dict(mapping))
+
+    def to_json_mapping(self) -> Dict[str, Union[str, int, float, bool]]:
+        """Return the fixed safe transport representation for this offer."""
+        return {
+            'schema_version': self.schema_version,
+            'provider': self.provider,
+            'instance_type': self.instance_type,
+            'region': self.region,
+            'accelerator_name': self.accelerator_name,
+            'accelerator_count': self.accelerator_count,
+            'cpu_count': self.cpu_count,
+            'memory_gib': self.memory_gib,
+            'device_memory_gib': self.device_memory_gib,
+            'hourly_price': self.hourly_price,
+            'use_spot': self.use_spot,
+        }
+
 
 RESOURCE_CONFIG_ALIASES = {
     'gpus': 'accelerators',
@@ -156,7 +272,7 @@ class Resources:
     """
     # If any fields changed, increment the version. For backward compatibility,
     # modify the __setstate__ method to handle the old version.
-    _VERSION = 35  # remove ephemeral_storage; use disk_size for k8s.
+    _VERSION = 36  # resolved cloud offer support.
 
     def __init__(
         self,
@@ -193,6 +309,7 @@ class Resources:
         _requires_fuse: Optional[bool] = None,
         _cluster_config_overrides: Optional[Dict[str, Any]] = None,
         _no_missing_accel_warnings: Optional[bool] = None,
+        _resolved_cloud_offer: Optional[ResolvedCloudOffer] = None,
     ):
         """Initialize a Resources object.
 
@@ -483,6 +600,7 @@ class Resources:
         self._set_volumes(volumes)
         self._set_local_disk(local_disk)
         self._max_hourly_cost = max_hourly_cost
+        self._set_resolved_cloud_offer(_resolved_cloud_offer)
 
     def validate(self):
         """Validate the resources and infer the missing fields if possible."""
@@ -651,6 +769,50 @@ class Resources:
         return self._instance_type
 
     @property
+    def resolved_cloud_offer(self) -> Optional[ResolvedCloudOffer]:
+        """The immutable provider offer bound to this resource, if any."""
+        return self._resolved_cloud_offer
+
+    def _matches_resolved_cloud_offer(self, offer: ResolvedCloudOffer) -> bool:
+        """Return whether this resource exactly represents ``offer``.
+
+        Compare the raw accelerator request rather than the public property:
+        the latter may consult a local catalog to infer accelerators from an
+        instance type, which is precisely what an offer-backed resource avoids.
+        """
+        if self.cloud is None or self.instance_type != offer.instance_type:
+            return False
+        if str(self.cloud).lower() != offer.provider.lower():
+            return False
+        if self.region != offer.region or self.use_spot != offer.use_spot:
+            return False
+        accelerators = self._accelerators
+        if accelerators is None or len(accelerators) != 1:
+            return False
+        accelerator_name, accelerator_count = next(iter(accelerators.items()))
+        return (accelerator_name == offer.accelerator_name and
+                accelerator_count == offer.accelerator_count)
+
+    def _set_resolved_cloud_offer(self,
+                                  offer: Optional[ResolvedCloudOffer]) -> None:
+        if offer is None:
+            self._resolved_cloud_offer = None
+            return
+        self._validate_resolved_cloud_offer(offer)
+        self._resolved_cloud_offer = offer
+
+    def _validate_resolved_cloud_offer(self, offer: ResolvedCloudOffer) -> None:
+        """Reject an offer that is not the exact immutable resource shape."""
+        if not isinstance(offer, ResolvedCloudOffer):
+            raise ValueError('Resolved cloud offer must be a '
+                             'ResolvedCloudOffer instance.')
+        if not self._matches_resolved_cloud_offer(offer):
+            raise ValueError(
+                'Resolved cloud offer does not exactly match the resource '
+                '(provider, instance type, region, accelerator, count, or '
+                'spot setting differs).')
+
+    @property
     @annotations.lru_cache(scope='global', maxsize=1)
     def cpus(self) -> Optional[str]:
         """Returns the number of vCPUs that each instance must have.
@@ -664,6 +826,8 @@ class Resources:
         """
         if self._cpus is not None:
             return self._cpus
+        if self._resolved_cloud_offer is not None:
+            return str(self._resolved_cloud_offer.cpu_count)
         if self.cloud is not None and self._instance_type is not None:
             vcpus, _ = self.cloud.get_vcpus_mem_from_instance_type(
                 self._instance_type)
@@ -681,6 +845,8 @@ class Resources:
         """
         if self._memory is not None:
             return self._memory
+        if self._resolved_cloud_offer is not None:
+            return str(self._resolved_cloud_offer.memory_gib)
         if self.cloud is not None and self._instance_type is not None:
             _, memory = self.cloud.get_vcpus_mem_from_instance_type(
                 self._instance_type)
@@ -699,6 +865,11 @@ class Resources:
         """
         if self._accelerators is not None:
             return self._accelerators
+        if self._resolved_cloud_offer is not None:
+            return {
+                self._resolved_cloud_offer.accelerator_name:
+                    self._resolved_cloud_offer.accelerator_count
+            }
         if self.cloud is not None and self._instance_type is not None:
             return self.cloud.get_accelerators_from_instance_type(
                 self._instance_type)
@@ -1245,6 +1416,9 @@ class Resources:
         Kubernetes credentias which may not be available locally when a remote
         API server is used.
         """
+        if self._resolved_cloud_offer is not None:
+            self._validate_resolved_cloud_offer(self._resolved_cloud_offer)
+            return
         if self._accelerators is None:
             return
         self._accelerators = {
@@ -1260,6 +1434,10 @@ class Resources:
             ValueError: if the attributes are invalid.
             exceptions.NoCloudAccessError: if no public cloud is enabled.
         """
+        if self._resolved_cloud_offer is not None:
+            self._validate_resolved_cloud_offer(self._resolved_cloud_offer)
+            return
+
         if self._region is None and self._zone is None:
             return
 
@@ -1381,6 +1559,10 @@ class Resources:
         if self.instance_type is None:
             return
 
+        if self._resolved_cloud_offer is not None:
+            self._validate_resolved_cloud_offer(self._resolved_cloud_offer)
+            return
+
         # Validate instance type
         if self.cloud is not None:
             valid = self.cloud.instance_type_exists(self._instance_type)
@@ -1432,8 +1614,14 @@ class Resources:
             # The _try_validate_instance_type() method infers and sets
             # self.cloud if self.instance_type is not None.
             assert self.cloud is not None
-            cpus, mem = self.cloud.get_vcpus_mem_from_instance_type(
-                self._instance_type)
+            cpus: Optional[float]
+            mem: Optional[float]
+            if self._resolved_cloud_offer is not None:
+                cpus = self._resolved_cloud_offer.cpu_count
+                mem = self._resolved_cloud_offer.memory_gib
+            else:
+                cpus, mem = self.cloud.get_vcpus_mem_from_instance_type(
+                    self._instance_type)
             if self._cpus is not None:
                 assert cpus is not None, (
                     f'Can\'t get vCPUs from instance type: '
@@ -1833,6 +2021,8 @@ class Resources:
     def _get_hourly_cost(self, region: Optional[str],
                          zone: Optional[str]) -> float:
         """Returns the joint hourly price of the instance and accelerators."""
+        if self._resolved_cloud_offer is not None:
+            return self._resolved_cloud_offer.hourly_price
         assert self.cloud is not None, 'Cloud must be specified'
         assert self._instance_type is not None, (
             'Instance type must be specified')
@@ -1851,6 +2041,8 @@ class Resources:
         assert self.cloud is not None, 'Cloud must be specified'
         assert self._instance_type is not None, (
             'Instance type must be specified')
+        if self._resolved_cloud_offer is not None:
+            return float(self._resolved_cloud_offer.hourly_price * hours)
         if self._region is None:
             # Without a pinned region, pricing the instance and the
             # accelerators independently would take each component's minimum
@@ -2348,6 +2540,8 @@ class Resources:
             _cluster_config_overrides=override_configs,
             _no_missing_accel_warnings=override.pop(
                 'no_missing_accel_warnings', self._no_missing_accel_warnings),
+            _resolved_cloud_offer=override.pop('_resolved_cloud_offer',
+                                               self._resolved_cloud_offer),
         )
         assert not override
         return resources
@@ -3017,6 +3211,9 @@ class Resources:
                 state['_disk_size'] = None
         elif not state['_disk_size_specified']:
             state['_disk_size'] = None
+
+        if version < 36:
+            state['_resolved_cloud_offer'] = None
 
         if version < 33:
             # Route legacy AutostopConfig.hook / hook_timeout attrs into the

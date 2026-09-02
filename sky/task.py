@@ -1,12 +1,13 @@
 """Task: a coarse-grained stage in an application."""
 import collections
+import collections.abc
 import copy
 import dataclasses
 import json
 import os
 import re
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Set,
+                    Tuple, Union)
 
 import colorama
 from pydantic import SecretStr
@@ -1252,6 +1253,60 @@ class Task:
     def metadata_json(self) -> str:
         return json.dumps(self._metadata)
 
+    def _resolved_cloud_offer_from_metadata(
+            self) -> Optional[resources_lib.ResolvedCloudOffer]:
+        raw_offer = self._metadata.get('resolved_cloud_offer')
+        if raw_offer is None:
+            return None
+        return resources_lib.ResolvedCloudOffer.from_json_mapping(raw_offer)
+
+    @staticmethod
+    def _bind_resolved_cloud_offer(
+        resources: Union[List['resources_lib.Resources'],
+                         Set['resources_lib.Resources']],
+        offer: Optional[resources_lib.ResolvedCloudOffer],
+    ) -> Union[List['resources_lib.Resources'], Set['resources_lib.Resources']]:
+        if offer is None:
+            return resources
+        matching_resources = [
+            resource for resource in resources
+            if resource._matches_resolved_cloud_offer(offer)  # pylint: disable=protected-access
+        ]
+        if len(matching_resources) != 1:
+            raise ValueError(
+                'Resolved cloud offer must match exactly one task resource '
+                '(provider, instance type, region, accelerator, count, and '
+                'spot setting must all match).')
+        matching_resource = matching_resources[0]
+        logger.debug(
+            'Binding resolved cloud offer provider=%s '
+            'instance_type=%s region=%s', offer.provider, offer.instance_type,
+            offer.region)
+        return type(resources)(
+            resource.copy(_resolved_cloud_offer=offer
+                         ) if resource is matching_resource else resource
+            for resource in resources)
+
+    def set_resolved_cloud_offer(
+        self, offer: Union[resources_lib.ResolvedCloudOffer, Mapping[str, Any]]
+    ) -> 'Task':
+        """Attach an immutable provider offer to exactly one task resource.
+
+        The offer is persisted as a fixed JSON mapping in task metadata so it
+        survives managed-job serialization without becoming a Resources YAML
+        field.
+        """
+        if isinstance(offer, collections.abc.Mapping):
+            offer = resources_lib.ResolvedCloudOffer.from_json_mapping(offer)
+        if not isinstance(offer, resources_lib.ResolvedCloudOffer):
+            raise ValueError('Resolved cloud offer must be a '
+                             'ResolvedCloudOffer or JSON mapping.')
+        bound_resources = self._bind_resolved_cloud_offer(self.resources, offer)
+        self._metadata = dict(self._metadata)
+        self._metadata['resolved_cloud_offer'] = offer.to_json_mapping()
+        self.resources = bound_resources
+        return self
+
     @property
     def envs(self) -> Dict[str, str]:
         return self._envs
@@ -1483,11 +1538,14 @@ class Task:
             resources = {resources}
         self._ensure_consistent_priority(resources)
         # TODO(woosuk): Check if the resources are None.
-        self.resources = _with_docker_login_config(resources, self.envs,
-                                                   self.secrets)
+        updated_resources = _with_docker_login_config(resources, self.envs,
+                                                      self.secrets)
         # Only have effect on RunPod.
-        self.resources = _with_docker_username_for_runpod(
-            self.resources, self.envs, self.secrets)
+        updated_resources = _with_docker_username_for_runpod(
+            updated_resources, self.envs, self.secrets)
+        updated_resources = self._bind_resolved_cloud_offer(
+            updated_resources, self._resolved_cloud_offer_from_metadata())
+        self.resources = updated_resources
 
         # Evaluate if the task requires FUSE and set the requires_fuse flag
         for _, storage_obj in self.storage_mounts.items():

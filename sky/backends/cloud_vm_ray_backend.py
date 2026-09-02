@@ -965,12 +965,10 @@ class RetryingVmProvisioner(object):
         # cases when the cluster exists have been handled above (either the
         # provision succeeded in the caller and no need to retry, or this
         # function raised an ResourcesUnavailableError).
-        for zones in cloud.zones_provision_loop(
+        for zones in cloud.zones_provision_loop_for_resources(
+                to_provision,
                 region=to_provision.region,
                 num_nodes=num_nodes,
-                instance_type=to_provision.instance_type,
-                accelerators=to_provision.accelerators,
-                use_spot=to_provision.use_spot,
         ):
             if zones is None:
                 yield None
