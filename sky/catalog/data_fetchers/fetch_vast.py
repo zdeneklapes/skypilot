@@ -37,7 +37,6 @@ _MAPPED_KEYS = (
     ('hosting_type', 'HostingType'),
 )
 
-_VAST_INSTANCE_TYPE_PREFIX = 'vastv2'
 _ACCELERATOR_MEMORY_VARIANTS = {
     ('A100', 80 * 1024): 'A100-80GB',
     ('V100', 32 * 1024): 'V100-32GB',
@@ -46,10 +45,10 @@ _ACCELERATOR_MEMORY_VARIANTS = {
 
 def create_instance_type(obj: Dict[str, Any], per_gpu_vram_mib: int) -> str:
     """Return a stable Vast type that preserves per-device VRAM."""
-    stubify = lambda x: re.sub(r'\s', '_', x)
-    return (f'{_VAST_INSTANCE_TYPE_PREFIX}-{obj["num_gpus"]}x-'
-            f'{stubify(obj["gpu_name"])}-{per_gpu_vram_mib}-'
-            f'{obj["cpu_cores"]}-{obj["cpu_ram"]}')
+    return vast.build_instance_type_from_offer({
+        **obj,
+        'gpu_ram': per_gpu_vram_mib,
+    })
 
 
 def get_per_gpu_vram_mib(offer: Dict[str, Any]) -> int:
@@ -103,11 +102,6 @@ def fetch_vast_catalog() -> List[Dict[str, Any]]:
     #
     #   * georegion consolidates geographic areas
     #
-    #   * chunked rounds down specifications (such
-    #     as 1025GB to 1024GB disk) in order to
-    #     make machine specifications look more
-    #     consistent
-    #
     #   * inet_down makes sure that only machines
     #     with "reasonable" downlink speed are
     #     considered
@@ -118,9 +112,9 @@ def fetch_vast_catalog() -> List[Dict[str, Any]]:
     #     small disk pools aren't listed
     #
     offer_list = vast.vast().search_offers(
-        query=('georegion = true chunked = true '
-               'inet_down >= 100 disk_space >= 80'),
-        limit=10000)
+        query=('georegion = true inet_down >= 100 disk_space >= 80'),
+        limit=10000,
+        no_default=True)
 
     price_map: Dict[str, List] = collections.defaultdict(list)
     for offer in offer_list:

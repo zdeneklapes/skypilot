@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import pickle
 import sys
 import types
 from typing import Any, Dict, List
@@ -26,6 +27,7 @@ from sky.utils import resources_utils
 _A100_INSTANCE_TYPE = 'vastv2-1x-A100-81920-4-8192'
 _RTX_A6000_INSTANCE_TYPE = 'vastv2-1x-RTX_A6000-49152-4-8192'
 _STALE_A100_INSTANCE_TYPE = 'vastv2-1x-A100_PCIE-81920-32-65536'
+_STALE_LEGACY_INSTANCE_TYPE = '1x-A100_SXM4-32-65536'
 
 _VALID_VAST_CATALOG_CSV = """InstanceType,AcceleratorName,AcceleratorCount,vCPUs,MemoryGiB,GpuInfo,Price,SpotPrice,Region
 1x-A100-4-8192,A100,1,4,8,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}\",0.8,0.8,any
@@ -88,6 +90,8 @@ def _make_vast_client(*methods: str) -> mock.Mock:
                 'geolocation': 'US',
                 'rentable': True,
                 'rented': False,
+                'external': False,
+                'dph_total': .8,
                 **offer,
             } for offer in client.search_offers.return_value]
 
@@ -146,8 +150,6 @@ def test_v2_metadata_survives_catalog_row_removal(monkeypatch):
             'A100 PCIE': 1
         }
     assert not vast_cloud.Vast().instance_type_exists(_STALE_A100_INSTANCE_TYPE)
-    with pytest.raises(ValueError, match='No instance type 1x-A100-32-65536'):
-        vast_catalog.get_vcpus_mem_from_instance_type('1x-A100-32-65536')
     with pytest.raises(ValueError, match='Invalid Vast instance type'):
         vast_catalog.get_vcpus_mem_from_instance_type('vastv2-invalid')
     with pytest.raises(ValueError, match='not found'):
@@ -180,6 +182,59 @@ def test_status_record_survives_v2_catalog_row_removal(monkeypatch):
     assert _STALE_A100_INSTANCE_TYPE in record['resources_str_full']
 
 
+def test_status_record_uses_absent_legacy_embedded_metadata(monkeypatch):
+    """Status keeps parseable legacy CPU, RAM, GPU name, and GPU count."""
+    legacy_catalog = pd.DataFrame([{
+        'InstanceType': _STALE_LEGACY_INSTANCE_TYPE,
+        'AcceleratorName': 'A100-80GB',
+        'AcceleratorCount': 1,
+        'vCPUs': 32,
+        'MemoryGiB': 64,
+        'GpuInfo': "{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}",
+        'Price': .9,
+        'SpotPrice': .9,
+        'Region': 'Prague, CZ, EU',
+    }])
+    monkeypatch.setattr(vast_catalog, '_df', legacy_catalog)
+    annotations.clear_request_level_cache()
+    resource = Resources(cloud=vast_cloud.Vast(),
+                         instance_type=_STALE_LEGACY_INSTANCE_TYPE)
+
+    monkeypatch.setattr(vast_catalog, '_df',
+                        pd.read_csv(io.StringIO(_VALID_VAST_CATALOG_CSV)))
+    annotations.clear_request_level_cache()
+
+    assert vast_catalog.get_vcpus_mem_from_instance_type(
+        _STALE_LEGACY_INSTANCE_TYPE) == (32, 64)
+    assert vast_catalog.get_accelerators_from_instance_type(
+        _STALE_LEGACY_INSTANCE_TYPE) == {
+            'A100 SXM4': 1
+        }
+
+    record: Dict[str, Any] = {
+        'handle': types.SimpleNamespace(launched_resources=resource,
+                                        launched_nodes=1,
+                                        cached_cluster_info=None)
+    }
+    backend_utils._update_records_with_handle_info([record],
+                                                   summary_response=True)
+
+    assert record['resources_str'].startswith('1x(gpus=A100 SXM4:1, ')
+    assert 'cpus=32' in record['resources_str_full']
+    assert 'mem=64' in record['resources_str_full']
+    assert not vast_cloud.Vast().instance_type_exists(
+        _STALE_LEGACY_INSTANCE_TYPE)
+    with pytest.raises(ValueError, match='ambiguous.*VRAM'):
+        vast_adaptor.get_offer_requirements(
+            _STALE_LEGACY_INSTANCE_TYPE,
+            region=None,
+            disk_size=64,
+            datacenter_only=False,
+            reliable_hosts=False,
+            network_tier='standard',
+        )
+
+
 def test_list_accelerators_keeps_distinct_gpu_memory_variants():
     """Listing must retain 40GB and 80GB variants with an otherwise equal shape."""
     catalog_df = pd.DataFrame([{
@@ -208,6 +263,39 @@ def test_list_accelerators_keeps_distinct_gpu_memory_variants():
                                                  None, None)
 
     assert [info.device_memory for info in accelerators['A100']] == [40., 80.]
+
+
+def test_vast_accelerator_aliases_are_unique_and_shape_preserving(monkeypatch):
+    """Normalized aliases keep base, workstation, and Max-Q GPUs distinct."""
+    catalog_df = pd.DataFrame([{
+        'InstanceType': 'vastv2-1x-RTX_PRO_6000_Max-Q-98304-16-65536',
+        'AcceleratorName': 'RTXPRO6000Max-Q',
+        'AcceleratorCount': 1,
+        'vCPUs': 16,
+        'MemoryGiB': 64,
+        'GpuInfo': "{'Gpus': [{'MemoryInfo': {'SizeInMiB': 98304}}]}",
+        'Price': 1.0,
+        'SpotPrice': .8,
+        'Region': 'any',
+    }, {
+        'InstanceType': 'vastv2-1x-RTX_PRO_6000_WS-98304-16-65536',
+        'AcceleratorName': 'RTXPRO6000WS',
+        'AcceleratorCount': 1,
+        'vCPUs': 16,
+        'MemoryGiB': 64,
+        'GpuInfo': "{'Gpus': [{'MemoryInfo': {'SizeInMiB': 98304}}]}",
+        'Price': 1.0,
+        'SpotPrice': .8,
+        'Region': 'any',
+    }])
+    monkeypatch.setattr(vast_catalog, '_df', catalog_df)
+    annotations.clear_request_level_cache()
+
+    instance_types, fuzzy = vast_catalog.get_instance_type_for_accelerator(
+        'RTX_PRO_6000_Max-Q', 1, cpus='128+', memory='512+')
+
+    assert instance_types == ['vastv2-1x-RTX_PRO_6000_Max-Q-98304-16-65536']
+    assert fuzzy == []
 
 
 def test_vast_catalog_rejects_missing_required_columns(monkeypatch):
@@ -258,9 +346,191 @@ def test_vast_country_extraction_uses_country_not_continent():
     assert vast_adaptor.extract_country_code('Jiangsu, CN, AS') == 'CN'
     assert vast_adaptor.extract_country_code('Japan, JP, AS') == 'JP'
     assert vast_adaptor.extract_country_code('France, FR, EU') == 'FR'
+    assert vast_adaptor.extract_country_code('CZ, EU') == 'CZ'
+    assert vast_adaptor.extract_country_code('Czechia, CZ') == 'CZ'
+    assert vast_adaptor.extract_country_code(
+        'Shinagawa District, Tokyo, JP') == 'JP'
+    assert vast_adaptor.extract_country_code(', CA, NA') == 'CA'
+    assert vast_adaptor.extract_country_code(', CN, AS') == 'CN'
+    assert vast_adaptor.extract_country_code(', US, NA') == 'US'
+    assert vast_adaptor.extract_country_code('US') == 'US'
+    assert vast_adaptor.extract_country_code('NA') == 'NA'
+    assert vast_adaptor.extract_country_code('AF') == 'AF'
+    assert vast_adaptor.extract_country_code('AS') == 'AS'
+    assert vast_adaptor.extract_country_code('SA') == 'SA'
 
     with pytest.raises(ValueError, match='country'):
         vast_adaptor.extract_country_code('France, FRA, EU')
+
+
+@pytest.mark.parametrize('region',
+                         ['France,,EU', 'France,FRA,EU', 'France,FR,'])
+def test_vast_country_extraction_rejects_malformed_regions(region):
+    """Malformed comma-delimited regions must fail closed."""
+    with pytest.raises(ValueError, match='country'):
+        vast_adaptor.extract_country_code(region)
+
+
+@pytest.mark.parametrize(('region', 'country_code'), [
+    ('Namibia, NA', 'NA'),
+    ('Afghanistan, AF', 'AF'),
+    ('Saudi Arabia, SA', 'SA'),
+])
+def test_vast_two_part_country_can_share_a_continent_code(region, country_code):
+    """Two-part locality/country forms resolve colliding ISO codes."""
+    assert vast_adaptor.extract_country_code(region) == country_code
+
+
+def test_vast_flexible_requirements_do_not_inherit_catalog_cpu_ram():
+    """A flexible 8+/32+ request accepts a 16 CPU/48 GiB live offer."""
+    requirements = vast_adaptor.get_offer_requirements(
+        _STALE_A100_INSTANCE_TYPE,
+        region='CZ',
+        disk_size=64,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+        cpus='8+',
+        memory='32+',
+        use_resource_constraints=True,
+    )
+    offer = {
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+        'disk_space': 200,
+        'geolocation': 'Czechia, CZ, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': 1.0,
+    }
+
+    assert vast_adaptor.offer_matches_requirements(offer, requirements)
+    query = vast_adaptor.build_offer_query(requirements)
+    assert 'cpu_cores>=8' in query
+    assert 'cpu_ram>=32' in query
+    assert 'cpu_cores>=32' not in query
+    assert 'cpu_ram>=64' not in query
+
+
+@pytest.mark.parametrize(
+    ('cpus', 'memory', 'offer_cpus', 'offer_ram_mib', 'matches'), [
+        ('8', '32', 8, 32768, True),
+        ('8', '32', 16, 32768, False),
+        ('8+', '4x', 16, 65536, True),
+        ('8+', '4x', 16, 49152, False),
+        (None, None, 16, 49152, True),
+        (None, None, 0, 49152, False),
+    ])
+def test_vast_offer_enforces_cpu_memory_modes(cpus, memory, offer_cpus,
+                                              offer_ram_mib, matches):
+    """Exact, minimum, ratio, and unspecified resource modes stay distinct."""
+    requirements = vast_adaptor.get_offer_requirements(
+        _STALE_A100_INSTANCE_TYPE,
+        region=None,
+        disk_size=64,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+        cpus=cpus,
+        memory=memory,
+        use_resource_constraints=True,
+    )
+    offer = {
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': offer_cpus,
+        'cpu_ram': offer_ram_mib,
+        'disk_space': 200,
+        'geolocation': 'CZ',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': 1.0,
+    }
+
+    assert vast_adaptor.offer_matches_requirements(offer,
+                                                   requirements) is matches
+
+
+def test_vast_explicit_type_keeps_encoded_cpu_memory_minimums():
+    """Explicit types keep their encoded shape despite looser resource hints."""
+    requirements = vast_adaptor.get_offer_requirements(
+        _STALE_A100_INSTANCE_TYPE,
+        region=None,
+        disk_size=64,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+        cpus='8+',
+        memory='32+',
+        use_resource_constraints=False,
+    )
+
+    assert requirements.cpu == vast_adaptor.NumericConstraint('minimum', 32)
+    assert requirements.memory == vast_adaptor.NumericConstraint(
+        'minimum', 65536)
+
+
+@pytest.mark.parametrize(('offer_fields', 'expected'), [
+    ({
+        'verification': 'verified'
+    }, True),
+    ({
+        'verification': 'unverified',
+        'verified': True,
+        'vericode': 1
+    }, False),
+    ({
+        'verification': '',
+        'verified': True
+    }, False),
+    ({
+        'verified': True
+    }, False),
+    ({
+        'verified': False,
+        'vericode': 1
+    }, True),
+    ({
+        'vericode': 1
+    }, True),
+    ({
+        'vericode': '1'
+    }, False),
+    ({
+        'vericode': True
+    }, False),
+    ({}, False),
+])
+def test_vast_offer_verification_schema_precedence(offer_fields, expected):
+    """Verification strings override numeric vericode; bool aliases are ignored."""
+    assert vast_adaptor.offer_is_verified(offer_fields) is expected
+
+
+@pytest.mark.parametrize('key, value', [
+    ('num_gpus', 1.5),
+    ('gpu_ram', 81920.5),
+    ('cpu_cores', 16.5),
+    ('cpu_ram', 49152.5),
+])
+def test_vast_resolved_type_rejects_fractional_shape_metadata(key, value):
+    """A resolved type never truncates provider shape metadata."""
+    offer = {
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+    }
+    offer[key] = value
+
+    with pytest.raises(ValueError, match='concrete shape metadata'):
+        vast_adaptor.build_instance_type_from_offer(offer)
 
 
 def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
@@ -286,6 +556,8 @@ def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
         'geolocation': 'Zurich, CH, EU',
         'rentable': False,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }, {
         'id': 2,
         'gpu_name': 'A100',
@@ -297,6 +569,8 @@ def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
         'geolocation': 'Zurich, CH, EU',
         'rentable': True,
         'rented': True,
+        'external': False,
+        'dph_total': .8,
     }, {
         'id': 3,
         'gpu_name': 'A100',
@@ -307,6 +581,8 @@ def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
         'disk_space': 64,
         'geolocation': 'Zurich, CH, EU',
         'rentable': True,
+        'external': False,
+        'dph_total': .8,
     }, {
         'id': 4,
         'gpu_name': 'A100',
@@ -318,6 +594,8 @@ def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
         'geolocation': 'Zurich, CH, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -330,6 +608,64 @@ def test_vast_live_query_requires_available_offers_without_catalog_bucketing(
     assert 'rented=false' in query
     assert 'chunked=true' not in query
     assert 'georegion=true' not in query
+
+
+@pytest.mark.parametrize('external_value', [None, pytest.param('missing')])
+def test_vast_live_offer_allows_unreported_external_state(external_value):
+    """A server-filtered offer may omit or null its external field."""
+    requirements = vast_adaptor.get_offer_requirements(
+        _A100_INSTANCE_TYPE,
+        region=None,
+        disk_size=64,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+    )
+    offer = {
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 4,
+        'cpu_ram': 8192,
+        'disk_space': 64,
+        'geolocation': 'Zurich, CH, EU',
+        'rentable': True,
+        'rented': False,
+        'dph_total': .8,
+    }
+    if external_value != 'missing':
+        offer['external'] = external_value
+
+    assert vast_adaptor.offer_matches_requirements(offer, requirements)
+
+
+@pytest.mark.parametrize('external_value', [True, 'unknown'])
+def test_vast_live_offer_rejects_explicit_invalid_external_state(
+        external_value):
+    """Explicit external or malformed external states fail admission."""
+    requirements = vast_adaptor.get_offer_requirements(
+        _A100_INSTANCE_TYPE,
+        region=None,
+        disk_size=64,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+    )
+    offer = {
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 4,
+        'cpu_ram': 8192,
+        'disk_space': 64,
+        'geolocation': 'Zurich, CH, EU',
+        'rentable': True,
+        'rented': False,
+        'external': external_value,
+        'dph_total': .8,
+    }
+
+    assert not vast_adaptor.offer_matches_requirements(offer, requirements)
 
 
 def test_vast_targeted_live_query_is_cached_per_requirements(monkeypatch):
@@ -350,7 +686,100 @@ def test_vast_targeted_live_query_is_cached_per_requirements(monkeypatch):
     assert vast_adaptor.get_live_offer_matches(requirements).offers == ()
 
     client.search_offers.assert_called_once_with(
-        query=vast_adaptor.build_offer_query(requirements), order='dph_total')
+        query=vast_adaptor.build_offer_query(requirements),
+        order='dph_total',
+        type='on-demand',
+        storage=64,
+        no_default=True)
+
+
+def test_vast_feasibility_resolves_actual_offer_shape_and_price(monkeypatch):
+    """Feasibility returns the admitted live shape without provider offer IDs."""
+    monkeypatch.setattr(
+        vast_catalog,
+        'get_instance_type_for_accelerator',
+        lambda *_args, **_kwargs: ([_STALE_A100_INSTANCE_TYPE], []),
+    )
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'id': 999,
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+        'disk_space': 200,
+        'geolocation': 'Czechia, CZ, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': 0.75,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    feasible = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  accelerators={'A100-80GB': 1},
+                  cpus='8+',
+                  memory='32+',
+                  disk_size=200,
+                  region='Czechia, CZ'))
+
+    assert len(feasible.resources_list) == 1
+    resolved = feasible.resources_list[0]
+    assert resolved.instance_type == ('vastv2-1x-A100_PCIE-81920-16-49152')
+    assert resolved.accelerators == {'A100-80GB': 1}
+    assert resolved.cpus == '16.0'
+    assert resolved.memory == '48.0'
+    assert resolved.resolved_cloud_offer is not None
+    assert resolved.resolved_cloud_offer.hourly_price == 0.75
+    assert '999' not in repr(resolved.resolved_cloud_offer)
+
+    copied = resolved.copy()
+    restored = pickle.loads(pickle.dumps(resolved))
+    assert copied.resolved_cloud_offer == resolved.resolved_cloud_offer
+    assert restored.resolved_cloud_offer == resolved.resolved_cloud_offer
+
+
+def test_vast_spot_query_uses_bid_price_storage_and_maximum(monkeypatch):
+    """Spot admission prices requested storage and enforces the live bid cap."""
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 4,
+        'cpu_ram': 8192,
+        'disk_space': 200,
+        'geolocation': 'US',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'min_bid': 0.6,
+        'dph_total': 5.0,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+    requirements = vast_adaptor.get_offer_requirements(
+        _A100_INSTANCE_TYPE,
+        region='US',
+        disk_size=200,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+        use_spot=True,
+        max_hourly_cost=0.5,
+    )
+
+    result = vast_adaptor.get_live_offer_matches(requirements)
+
+    assert result.offers == ()
+    assert result.rejection_counts == (('price', 1),)
+    client.search_offers.assert_called_once_with(
+        query=vast_adaptor.build_offer_query(requirements),
+        order='min_bid',
+        type='bid',
+        storage=200,
+        no_default=True)
 
 
 def test_vast_precheck_and_provisioning_share_exact_available_query(
@@ -426,6 +855,8 @@ def test_vast_v2_identity_rejects_lower_memory_live_offer(monkeypatch):
         'geolocation': 'Georgia, US, NA',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .5,
     }, {
         'id': 80,
         'gpu_name': 'A100 SXM4',
@@ -437,6 +868,8 @@ def test_vast_v2_identity_rejects_lower_memory_live_offer(monkeypatch):
         'geolocation': 'Prague, CZ, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .9,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -485,6 +918,48 @@ def test_vast_legacy_identity_fails_closed_when_memory_is_ambiguous(
         )
 
 
+def test_vast_new_scheduling_ignores_legacy_catalog_rows(monkeypatch):
+    """New placement cannot select legacy rows whose VRAM identity is absent."""
+    catalog_df = pd.DataFrame([{
+        'InstanceType': '1x-A100_SXM4-32-65536',
+        'AcceleratorName': 'A100-80GB',
+        'AcceleratorCount': 1,
+        'vCPUs': 32,
+        'MemoryGiB': 64,
+        'GpuInfo': "{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}",
+        'Price': .9,
+        'SpotPrice': .9,
+        'Region': 'Prague, CZ, EU',
+    }])
+    monkeypatch.setattr(vast_catalog, '_df', catalog_df)
+    annotations.clear_request_level_cache()
+
+    instance_types, _ = vast_catalog.get_instance_type_for_accelerator(
+        'A100-80GB', 1)
+
+    assert instance_types is None
+
+
+def test_vast_default_planning_ignores_legacy_catalog_rows(monkeypatch):
+    """CPU and memory placement cannot select an unsupported legacy type."""
+    catalog_df = pd.DataFrame([{
+        'InstanceType': '1x-A100_SXM4-32-65536',
+        'AcceleratorName': 'A100-80GB',
+        'AcceleratorCount': 1,
+        'vCPUs': 32,
+        'MemoryGiB': 64,
+        'GpuInfo': "{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}",
+        'Price': .9,
+        'SpotPrice': .9,
+        'Region': 'Prague, CZ, EU',
+    }])
+    monkeypatch.setattr(vast_catalog, '_df', catalog_df)
+    annotations.clear_request_level_cache()
+
+    assert vast_catalog.get_default_instance_type(cpus='8+',
+                                                  memory='32+') is None
+
+
 def test_vast_live_admission_uses_targeted_country_query(monkeypatch):
     """An explicit Vast region remains a strict live country constraint."""
     monkeypatch.setattr(
@@ -503,6 +978,8 @@ def test_vast_live_admission_uses_targeted_country_query(monkeypatch):
         'geolocation': 'Paris, FR, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -557,6 +1034,8 @@ def test_vast_country_constraint_bypasses_catalog_locality(
         'geolocation': offer_region,
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -597,6 +1076,8 @@ def test_vast_live_admission_uses_any_for_unscoped_marketplace_capacity(
         'geolocation': 'Zurich, CH, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -627,6 +1108,8 @@ def test_vast_unscoped_docker_image_survives_admission_and_deployment(
         'geolocation': 'Zurich, CH, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
     cloud = vast_cloud.Vast()
@@ -646,10 +1129,13 @@ def test_vast_unscoped_docker_image_survives_admission_and_deployment(
     assert 'geolocation' not in client.search_offers.call_args.kwargs['query']
 
     with mock.patch.object(
-            cloud, 'get_accelerators_from_instance_type',
-            return_value={'A100': 1}), mock.patch(
-                'sky.clouds.vast.skypilot_config.get_effective_region_config',
-                side_effect=lambda **kwargs: kwargs['default_value']):
+            cloud,
+            'get_accelerators_from_instance_type',
+            side_effect=AssertionError('resolved deployment used catalog')) as (
+                catalog_lookup), mock.patch(
+                    'sky.clouds.vast.skypilot_config.'
+                    'get_effective_region_config',
+                    side_effect=lambda **kwargs: kwargs['default_value']):
         deploy_variables = cloud.make_deploy_resources_variables(
             resources=admitted_resources,
             cluster_name=resources_utils.ClusterName('test', 'test'),
@@ -659,32 +1145,23 @@ def test_vast_unscoped_docker_image_survives_admission_and_deployment(
         )
 
     assert deploy_variables['image_id'] == requested_image
+    assert deploy_variables['resolved_shape'] is True
+    catalog_lookup.assert_not_called()
 
 
-def test_vast_live_admission_retries_once_after_forced_catalog_refresh(
-        monkeypatch):
-    """An unscoped live miss refreshes catalog metadata and retries once."""
+def test_vast_live_miss_does_not_refresh_catalog(monkeypatch):
+    """A live capacity miss does not force-refresh stable GPU metadata."""
     monkeypatch.setattr(
         vast_catalog,
         'get_instance_type_for_accelerator',
         lambda *_args, **_kwargs: ([_A100_INSTANCE_TYPE], []),
     )
     client = mock.Mock(spec=['search_offers'])
-    client.search_offers.side_effect = [[],
-                                        [{
-                                            'gpu_name': 'A100',
-                                            'num_gpus': 1,
-                                            'gpu_ram': 81920,
-                                            'cpu_cores': 4,
-                                            'cpu_ram': 8192,
-                                            'disk_space': 64,
-                                            'geolocation': 'Zurich, CH, EU',
-                                            'rentable': True,
-                                            'rented': False,
-                                        }]]
+    client.search_offers.return_value = []
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
     refresh_catalog = mock.Mock(return_value=True)
-    monkeypatch.setattr(vast_refresh, 'refresh_catalog', refresh_catalog)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
 
     feasible_resources = vast_cloud.Vast()._get_feasible_launchable_resources(
         Resources(
@@ -693,10 +1170,184 @@ def test_vast_live_admission_retries_once_after_forced_catalog_refresh(
             disk_size=64,
         ))
 
-    assert [resource.region for resource in feasible_resources.resources_list
-           ] == ['any']
-    refresh_catalog.assert_called_once_with(force=True)
-    assert client.search_offers.call_count == 2
+    assert feasible_resources.resources_list == []
+    refresh_catalog.assert_called_once_with(force=False)
+    assert client.search_offers.call_count == 1
+
+
+def test_vast_missing_accelerator_metadata_forces_one_refresh(monkeypatch):
+    """A missing GPU identity triggers one force refresh before giving up."""
+    candidates = mock.Mock(side_effect=[(None, []), ([_A100_INSTANCE_TYPE],
+                                                     [])])
+    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
+                        candidates)
+    refresh_catalog = mock.Mock(return_value=True)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = []
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(), accelerators={'A100': 1}))
+
+    assert result.resources_list == []
+    assert refresh_catalog.call_args_list == [
+        mock.call(force=False), mock.call(force=True)
+    ]
+    assert candidates.call_count == 2
+
+
+def test_vast_missing_default_metadata_recovers_after_refresh(monkeypatch):
+    """A default Vast request retries catalog planning after forced refresh."""
+    candidates = mock.Mock(side_effect=[[], [_A100_INSTANCE_TYPE]])
+    monkeypatch.setattr(vast_catalog, 'get_default_instance_types', candidates)
+    refresh_catalog = mock.Mock(return_value=True)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 8,
+        'cpu_ram': 32768,
+        'disk_space': 64,
+        'geolocation': 'Zurich, CH, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': .8,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  cpus='8+',
+                  memory='32+',
+                  disk_size=64))
+
+    assert len(result.resources_list) == 1
+    assert refresh_catalog.call_args_list == [
+        mock.call(force=False), mock.call(force=True)
+    ]
+    assert candidates.call_count == 2
+
+
+def test_vast_default_request_defers_constraints_to_live_marketplace(
+        monkeypatch):
+    """Default placement must not apply mutable catalog-only constraints."""
+    second_instance_type = 'vastv2-1x-RTX_A6000-49152-4-8192'
+    candidates = mock.Mock(
+        return_value=[_A100_INSTANCE_TYPE, second_instance_type])
+    monkeypatch.setattr(vast_catalog, 'get_default_instance_types', candidates)
+    refresh_catalog = mock.Mock(return_value=True)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.side_effect = [[],
+                                        [{
+                                            'gpu_name': 'RTX A6000',
+                                            'num_gpus': 1,
+                                            'gpu_ram': 49152,
+                                            'cpu_cores': 8,
+                                            'cpu_ram': 32768,
+                                            'disk_space': 100,
+                                            'geolocation': 'Prague, CZ, EU',
+                                            'rentable': True,
+                                            'rented': False,
+                                            'external': None,
+                                            'dph_total': .8,
+                                        }]]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  cpus='4+',
+                  memory='16+',
+                  region='Czechia, CZ, EU',
+                  disk_size=100,
+                  max_hourly_cost=1.0))
+
+    assert len(result.resources_list) == 1
+    candidates.assert_called_once_with(zone=None)
+    query = client.search_offers.call_args_list[1].kwargs['query']
+    assert 'cpu_cores>=4' in query
+    assert 'cpu_ram>=16' in query
+    assert 'geolocation=CZ' in query
+    assert result.resources_list[0].resolved_cloud_offer.hourly_price == .8
+
+
+@pytest.mark.parametrize('refresh_failure', ['exception', 'false'])
+def test_vast_failed_metadata_refresh_returns_actionable_hint(
+        monkeypatch, refresh_failure):
+    """A failed forced refresh reports safe retry guidance for missing metadata."""
+    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
+                        lambda *_args, **_kwargs: (None, []))
+
+    def refresh_catalog(*, force):
+        if force:
+            if refresh_failure == 'exception':
+                raise RuntimeError('credential-secret')
+            return False
+        return True
+
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(), accelerators={'A100': 1}))
+
+    assert result.resources_list == []
+    assert result.hint is not None
+    assert 'catalog refresh' in result.hint.lower()
+    assert 'retry' in result.hint.lower()
+    assert 'credential-secret' not in result.hint
+
+
+@pytest.mark.parametrize('refresh_failure', ['exception', 'false'])
+def test_vast_failed_default_metadata_refresh_returns_actionable_hint(
+        monkeypatch, refresh_failure):
+    """A default request reports safe retry guidance when refresh fails."""
+    monkeypatch.setattr(vast_catalog, 'get_default_instance_types',
+                        lambda **_kwargs: [])
+
+    def refresh_catalog(*, force):
+        if force:
+            if refresh_failure == 'exception':
+                raise RuntimeError('credential-secret')
+            return False
+        return True
+
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(), cpus='8+', memory='32+'))
+
+    assert result.resources_list == []
+    assert result.hint is not None
+    assert 'catalog refresh' in result.hint.lower()
+    assert 'resource metadata' in result.hint.lower()
+    assert 'retry' in result.hint.lower()
+    assert 'credential-secret' not in result.hint
+
+
+def test_vast_explicit_instance_type_bypasses_catalog_refresh(monkeypatch):
+    """Explicit stable instance types never refresh accelerator metadata."""
+    refresh_catalog = mock.Mock(return_value=True)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = []
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  instance_type=_A100_INSTANCE_TYPE,
+                  disk_size=64))
+
+    refresh_catalog.assert_not_called()
 
 
 def test_vast_live_admission_reports_sanitized_rejection_counts(monkeypatch):
@@ -712,6 +1363,8 @@ def test_vast_live_admission_reports_sanitized_rejection_counts(monkeypatch):
         'geolocation': 'Private locality, FR, EU',
         'rentable': True,
         'rented': False,
+        'external': False,
+        'dph_total': .8,
     }]
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
 
@@ -725,7 +1378,7 @@ def test_vast_live_admission_reports_sanitized_rejection_counts(monkeypatch):
 
     assert feasible_resources.resources_list == []
     assert feasible_resources.hint is not None
-    assert 'offers examined=1' in feasible_resources.hint
+    assert 'offers returned=1' in feasible_resources.hint
     assert 'disk=1' in feasible_resources.hint
     assert 'Private locality' not in feasible_resources.hint
 
@@ -766,7 +1419,9 @@ def test_vast_live_offer_match_enforces_host_and_network_policy():
         'geolocation': 'Paris, FR, EU',
         'rentable': True,
         'rented': False,
-        'verified': True,
+        'external': False,
+        'dph_total': .8,
+        'verification': 'verified',
         'datacenter': True,
         'hosting_type': 1,
         'reliability': 0.99,
@@ -943,7 +1598,7 @@ def test_launch_uses_reliable_filters_and_excludes_failed_machine(monkeypatch):
         "cpu_ram": 8192,
         "disk_space": 30,
         "geolocation": "US",
-        "verified": True,
+        "verification": "verified",
         "datacenter": True,
         "hosting_type": 1,
         "inet_down": 1000,
@@ -958,7 +1613,7 @@ def test_launch_uses_reliable_filters_and_excludes_failed_machine(monkeypatch):
         "cpu_ram": 8192,
         "disk_space": 30,
         "geolocation": "US",
-        "verified": True,
+        "verification": "verified",
         "datacenter": True,
         "hosting_type": 1,
         "inet_down": 1000,
@@ -991,10 +1646,10 @@ def test_launch_uses_reliable_filters_and_excludes_failed_machine(monkeypatch):
     for filter_expression in (
             "verified=true",
             "datacenter=true",
-            "hosting_type>=1",
             "inet_down>=1000",
     ):
         assert filter_expression in query
+    assert "hosting_type" not in query
     assert client.create_instance.call_args.kwargs["id"] == 456
 
 
@@ -1012,7 +1667,7 @@ def test_live_query_survives_vast_sdk_preprocessing(monkeypatch):
         "cpu_ram": 8192,
         "disk_space": 30,
         "geolocation": "US",
-        "verified": True,
+        "verification": "verified",
         "datacenter": True,
         "hosting_type": 1,
         "inet_down": 1000,

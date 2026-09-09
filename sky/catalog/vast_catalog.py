@@ -72,6 +72,58 @@ def _catalog_df() -> pd.DataFrame:
             'Local Vast catalog is not valid CSV.') from exc
 
 
+def reload_catalog() -> None:
+    """Reload only Vast metadata after an atomic local catalog refresh."""
+    global _df
+    _df = common.read_catalog('vast/vms.csv')
+    _catalog_df.cache_clear()
+
+
+def _normalize_accelerator_alias(name: str) -> str:
+    """Normalize only harmless Vast accelerator spelling differences."""
+    return str(name).casefold().replace(' ', '').replace('_', '')
+
+
+def _matching_accelerator_rows(catalog_df: pd.DataFrame,
+                               acc_name: str) -> pd.DataFrame:
+    """Resolve exact names first, then one unique normalized name."""
+    accelerator_names = catalog_df['AcceleratorName'].astype(str)
+    exact_rows = catalog_df[accelerator_names == acc_name]
+    if not exact_rows.empty:
+        return exact_rows
+    normalized_name = _normalize_accelerator_alias(acc_name)
+    normalized_matches = accelerator_names.map(
+        _normalize_accelerator_alias) == normalized_name
+    matching_names = set(accelerator_names[normalized_matches])
+    if len(matching_names) != 1:
+        return catalog_df.iloc[0:0]
+    return catalog_df[normalized_matches]
+
+
+def get_canonical_accelerator_name(instance_type: str,
+                                   requested_name: Optional[str] = None) -> str:
+    """Return the catalog's canonical name for a raw Vast GPU identity."""
+    rows = _catalog_df()
+    rows = rows[rows['InstanceType'] == instance_type]
+    canonical_names = set(rows['AcceleratorName'].dropna().astype(str))
+    if len(canonical_names) == 1:
+        return canonical_names.pop()
+    if requested_name is not None:
+        matching_rows = _matching_accelerator_rows(_catalog_df(),
+                                                   requested_name)
+        matching_names = set(
+            matching_rows['AcceleratorName'].dropna().astype(str))
+        if len(matching_names) == 1:
+            return matching_names.pop()
+        return requested_name
+    return vast_adaptor.get_offer_requirements(instance_type,
+                                               region=None,
+                                               disk_size=1,
+                                               datacenter_only=False,
+                                               reliable_hosts=False,
+                                               network_tier='standard').gpu_name
+
+
 def _apply_datacenter_filter(df: pd.DataFrame,
                              datacenter_only: bool) -> pd.DataFrame:
     """Filter dataframe by hosting_type if datacenter_only is True.
@@ -84,6 +136,13 @@ def _apply_datacenter_filter(df: pd.DataFrame,
         return df.iloc[0:0]
     hosting_type = pd.to_numeric(df['HostingType'], errors='coerce')
     return df[hosting_type.ge(1)]
+
+
+def _planning_catalog_df() -> pd.DataFrame:
+    """Return only v2 rows supported by new Vast placement paths."""
+    catalog_df = _catalog_df()
+    supported = catalog_df['InstanceType'].astype(str).str.startswith('vastv2-')
+    return catalog_df[supported]
 
 
 def instance_type_exists(instance_type: str) -> bool:
@@ -108,6 +167,20 @@ def _get_missing_v2_instance_type_requirements(
     logger.debug('Using embedded metadata for stale Vast v2 instance type %s',
                  instance_type)
     return requirements
+
+
+def _get_missing_legacy_instance_type_metadata(
+        catalog_df: pd.DataFrame,
+        instance_type: str) -> Optional[vast_adaptor.VastInstanceTypeMetadata]:
+    """Parse an absent legacy identity for status metadata only."""
+    if (instance_type.startswith('vastv2-') or
+            common.instance_type_exists_impl(catalog_df, instance_type)):
+        return None
+    metadata = vast_adaptor.get_instance_type_metadata(instance_type)
+    logger.debug(
+        'Using embedded status metadata for absent legacy Vast '
+        'instance type %s', instance_type)
+    return metadata
 
 
 def validate_region_zone(
@@ -142,10 +215,16 @@ def get_hourly_cost(instance_type: str,
 def get_vcpus_mem_from_instance_type(
         instance_type: str) -> Tuple[Optional[float], Optional[float]]:
     catalog_df = _catalog_df()
+    legacy_metadata = _get_missing_legacy_instance_type_metadata(
+        catalog_df, instance_type)
+    if legacy_metadata is not None:
+        return legacy_metadata.cpu_cores, legacy_metadata.cpu_ram_mib / 1024
     requirements = _get_missing_v2_instance_type_requirements(
         catalog_df, instance_type)
     if requirements is not None:
-        return requirements.cpu_cores, requirements.cpu_ram_mib / 1024
+        cpu_ram_mib = requirements.cpu_ram_mib
+        assert cpu_ram_mib is not None
+        return requirements.cpu_cores, cpu_ram_mib / 1024
     return common.get_vcpus_mem_from_instance_type_impl(catalog_df,
                                                         instance_type)
 
@@ -163,15 +242,44 @@ def get_default_instance_type(cpus: Optional[str] = None,
     del disk_tier, local_disk
     # NOTE: After expanding catalog to multiple entries, you may
     # want to specify a default instance type or family.
-    df = _apply_datacenter_filter(_catalog_df(), datacenter_only)
+    df = _apply_datacenter_filter(_planning_catalog_df(), datacenter_only)
     return common.get_instance_type_for_cpus_mem_impl(df, cpus, memory, region,
                                                       zone, use_spot,
                                                       max_hourly_cost)
 
 
+def _representative_instance_types(rows: pd.DataFrame) -> List[str]:
+    """Return one stable type for every raw GPU/count/VRAM identity."""
+    identities: Dict[Tuple[str, int, int], str] = {}
+    for instance_type in rows['InstanceType']:
+        requirements = vast_adaptor.get_offer_requirements(
+            str(instance_type),
+            region=None,
+            disk_size=1,
+            datacenter_only=False,
+            reliable_hosts=False,
+            network_tier='standard')
+        key = (requirements.gpu_name.casefold(), requirements.num_gpus,
+               requirements.gpu_ram_mib)
+        identities.setdefault(key, str(instance_type))
+    return list(identities.values())
+
+
+def get_default_instance_types(zone: Optional[str] = None) -> List[str]:
+    """Return every supported GPU identity for live default placement."""
+    if zone is not None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError('Vast does not support zones.')
+    return _representative_instance_types(_planning_catalog_df())
+
+
 def get_accelerators_from_instance_type(
         instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
     catalog_df = _catalog_df()
+    legacy_metadata = _get_missing_legacy_instance_type_metadata(
+        catalog_df, instance_type)
+    if legacy_metadata is not None:
+        return {legacy_metadata.gpu_name: legacy_metadata.num_gpus}
     requirements = _get_missing_v2_instance_type_requirements(
         catalog_df, instance_type)
     if requirements is not None:
@@ -221,27 +329,29 @@ def get_instance_type_for_accelerator(
         zone: Optional[str] = None,
         max_hourly_cost: Optional[float] = None,
         datacenter_only: bool = False) -> Tuple[Optional[List[str]], List[str]]:
-    """Returns a list of instance types that have the given accelerator.
+    """Return representative catalog types for a raw GPU identity.
 
-    Args:
-        datacenter_only: If True, only return instances hosted in datacenters
-            (hosting_type >= 1).
+    CPU, RAM, locality, host policy, market, and price are checked live.
     """
-    del local_disk  # unused
+    del (cpus, memory, use_spot, local_disk, region, max_hourly_cost,
+         datacenter_only)
     if zone is not None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError('Vast does not support zones.')
-    df = _apply_datacenter_filter(_catalog_df(), datacenter_only)
-    return common.get_instance_type_for_accelerator_impl(
-        df=df,
-        acc_name=acc_name,
-        acc_count=acc_count,
-        cpus=cpus,
-        memory=memory,
-        use_spot=use_spot,
-        region=region,
-        zone=zone,
-        max_hourly_cost=max_hourly_cost)
+    catalog_df = _planning_catalog_df()
+    rows = _matching_accelerator_rows(catalog_df, acc_name)
+    accelerator_count = pd.to_numeric(rows['AcceleratorCount'], errors='coerce')
+    rows = rows[(accelerator_count - float(acc_count)).abs() <= 0.01]
+    if rows.empty:
+        _, fuzzy_candidates = common.get_instance_type_for_accelerator_impl(
+            df=catalog_df,
+            acc_name=acc_name,
+            acc_count=acc_count,
+        )
+        return None, fuzzy_candidates
+
+    # CPU, RAM, locality, host policy, and live price are marketplace state.
+    return _representative_instance_types(rows), []
 
 
 def get_region_zones_for_instance_type(instance_type: str,

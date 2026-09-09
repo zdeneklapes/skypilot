@@ -9,8 +9,10 @@ import time
 import filelock
 
 from sky import sky_logging
+from sky.adaptors import vast as vast_adaptor
 from sky.catalog import common as catalog_common
 from sky.catalog.data_fetchers import fetch_vast
+from sky.utils import annotations
 
 CATALOG_FILENAME = 'vast/vms.csv'
 DEFAULT_MAX_AGE_SECONDS = 20 * 60
@@ -45,6 +47,7 @@ def validate_catalog(path: Path) -> None:
             raise ValueError(
                 f'Vast catalog is missing required columns: {missing}')
 
+        usable_rows = 0
         for row in reader:
             try:
                 accelerator_count = float(row['AcceleratorCount'])
@@ -52,7 +55,27 @@ def validate_catalog(path: Path) -> None:
                 continue
             if (row.get('AcceleratorName') and accelerator_count > 0 and
                     row.get('GpuInfo')):
-                return
+                instance_type = row.get('InstanceType') or ''
+                if not instance_type.startswith('vastv2-'):
+                    raise ValueError(
+                        'Vast catalog usable rows require supported vastv2 '
+                        'instance types.')
+                try:
+                    vast_adaptor.get_offer_requirements(
+                        instance_type,
+                        region=None,
+                        disk_size=1,
+                        datacenter_only=False,
+                        reliable_hosts=False,
+                        network_tier='standard',
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        'Vast catalog usable rows require supported vastv2 '
+                        'instance types.') from exc
+                usable_rows += 1
+        if usable_rows:
+            return
     raise ValueError('Vast catalog does not contain usable GPU entries')
 
 
@@ -118,6 +141,7 @@ def refresh_catalog(force: bool = False) -> bool:
             records_after = _count_catalog_records(staged)
             records_fetched = len(fetched_records)
             if target.is_file() and staged.read_bytes() == target.read_bytes():
+                os.replace(staged, target)
                 logger.info(
                     'Vast catalog fetched but CSV is unchanged: path=%s '
                     'records_before=%d records_fetched=%d records_after=%d.',
@@ -137,13 +161,26 @@ def refresh_catalog(force: bool = False) -> bool:
                 except Exception:  # pylint: disable=broad-except
                     pass
                 else:
-                    logger.warning(
-                        'Vast catalog refresh failed; using the validated '
-                        'existing CSV: path=%s records=%d.', target,
-                        _count_catalog_records(target))
-                    return True
+                    if not force:
+                        logger.warning(
+                            'Vast catalog refresh failed; using the validated '
+                            'existing CSV: path=%s records=%d.', target,
+                            _count_catalog_records(target))
+                        return True
             raise RuntimeError(
                 'Vast catalog refresh failed and no valid existing catalog '
                 'is available') from None
         finally:
             staged.unlink(missing_ok=True)
+
+
+@annotations.lru_cache(scope='request', maxsize=2)
+def refresh_catalog_for_request(force: bool = False) -> bool:
+    """Refresh and reload Vast metadata at most once per force mode/request."""
+    refreshed = refresh_catalog(force=force)
+    if refreshed:
+        # Import lazily to avoid a catalog import cycle.
+        # pylint: disable=import-outside-toplevel
+        from sky.catalog import vast_catalog
+        vast_catalog.reload_catalog()
+    return refreshed

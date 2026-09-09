@@ -147,17 +147,6 @@ def matches_gpu(offer: Any, requirements: vast.VastOfferRequirements) -> bool:
             offer_gpu_ram_mib >= requirements.gpu_ram_mib)
 
 
-def _offer_price(offer: Dict[str, Any]) -> float:
-    """Return a sortable on-demand price, putting malformed values last."""
-    price = offer.get('dph_total')
-    if price is None:
-        return math.inf
-    try:
-        return float(price)
-    except (TypeError, ValueError):
-        return math.inf
-
-
 def _validate_created_instance(
         instance: Any, requirements: vast.VastOfferRequirements) -> None:
     """Raise when a created contract does not identify the requested GPU."""
@@ -216,7 +205,9 @@ def launch(name: str,
            private_docker_registry: Optional[bool] = None,
            login: Optional[str] = None,
            create_instance_kwargs: Optional[Dict[str, Any]] = None,
-           ssh_public_key: Optional[str] = None) -> str:
+           ssh_public_key: Optional[str] = None,
+           resolved_shape: bool = False,
+           max_hourly_cost: Optional[float] = None) -> str:
     """Launches an instance with the given parameters.
 
     Converts the instance_type to the Vast GPU name, finds the specs for the
@@ -243,38 +234,10 @@ def launch(name: str,
       - args: Custom docker command arguments as list of strings
       - user: Run as specific user
 
-    Notes:
-      *  `georegion`: This is a feature flag to provide an additional
-         scope of geographical specificy while maintaining backward
-         compatibility.
-      *  `chunked`: This is a feature flag to give breadth to the
-         snowflake nature of the vast catalog marketplace. It rounds
-         down various specifications of machines to emulate an instance
-         type and make them more interchangeable.
-      *  `disk_size`: We look for instances that are of the requested
-         size or greater than it. For instance, `disk_size=100` might
-         return something with `disk_size` at 102 or even 1000.
-         The disk size {xx} GB is not exactly matched the requested
-         size {yy} GB. It is possible to charge extra cost on disk.
-      *  `ports`: This is a feature flag to expose ports to the internet.
-      *  `geolocation`: Geolocation on Vast can be as specific as the
-         host chooses to be. They can say, for instance, "Yutakachō,
-         Shinagawa District, Tokyo, JP." Such a specific geolocation
-         as ours would fail to return this host in a simple string
-         comparison if a user searched for "JP".
-         Since regardless of specificity, all our geolocations end
-         in two-letter country codes we just snip that to conform
-         to how many providers state their geolocation.
-      *  Since the catalog is cached, we can't gaurantee availability
-         of any machine at the point of inquiry.  As a consequence we
-         search for the machine again and potentially return a failure
-         if there is no availability.
-	  *  We pass in the cpu_ram here as a guarantor to make sure the
-		 instance we match with will be compliant with the requested
-		 amount of memory.
-      *  Vast instance types are an invention for skypilot. Refer to
-         catalog/vast_catalog.py for the current construction
-         of the type.
+    Vast instance types are SkyPilot identifiers. Provisioning always
+    rechecks current marketplace availability and policy constraints. A
+    provider-resolved type additionally requires its exact encoded CPU/RAM
+    shape; explicit user-supplied types retain minimum CPU/RAM semantics.
     """
     # Vast.ai SDK v6+ no longer accepts port mappings via the env field, so
     # `ports` is currently unused. Keep it in the signature for caller
@@ -294,13 +257,15 @@ def launch(name: str,
         datacenter_only=secure_only,
         reliable_hosts=reliable_hosts,
         network_tier=network_tier,
+        use_spot=preemptible,
+        max_hourly_cost=max_hourly_cost,
+        resolved_shape=resolved_shape,
     )
     gpu_name = requirements.gpu_name
     num_gpus = requirements.num_gpus
     query_str = vast.build_offer_query(requirements)
 
-    raw_instance_list = vast.vast().search_offers(query=query_str,
-                                                  order='dph_total')
+    raw_instance_list = vast.search_offers(requirements)
 
     excluded_machine_id_strings = {
         str(machine_id) for machine_id in excluded_machine_ids or []
@@ -314,7 +279,12 @@ def launch(name: str,
         ]
     else:
         instance_list = []
-    instance_list.sort(key=_offer_price)
+
+    def _offer_sort_price(offer: Dict[str, Any]) -> float:
+        price = vast.get_offer_hourly_price(offer, preemptible)
+        return math.inf if price is None else price
+
+    instance_list.sort(key=_offer_sort_price)
 
     if len(instance_list) == 0:
         raise exceptions.VastOfferUnavailableError(
@@ -393,11 +363,12 @@ def launch(name: str,
         launch_params['env'] = normalize_env(user_env)
         return launch_params
 
+    price_key = 'min_bid' if preemptible else 'dph_total'
     for offer_index, instance_touse in enumerate(instance_list):
-        logger.info(
-            'Selected Vast offer id=%s gpu_name=%s num_gpus=%s dph_total=%s',
-            instance_touse.get('id'), instance_touse.get('gpu_name'),
-            instance_touse.get('num_gpus'), instance_touse.get('dph_total'))
+        logger.info('Selected Vast offer id=%s gpu_name=%s num_gpus=%s %s=%s',
+                    instance_touse.get('id'), instance_touse.get('gpu_name'),
+                    instance_touse.get('num_gpus'), price_key,
+                    instance_touse.get(price_key))
         launch_params = _build_launch_params(instance_touse)
         try:
             new_instance_contract = vast.vast().create_instance(**launch_params)

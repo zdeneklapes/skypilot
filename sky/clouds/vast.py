@@ -6,10 +6,10 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from sky import catalog
 from sky import clouds
+from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common
 from sky.adaptors import vast as vast_adaptor
-from sky.utils import annotations
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import ux_utils
@@ -20,6 +20,7 @@ if typing.TYPE_CHECKING:
 
 _CREDENTIAL_PATH = '~/.config/vastai/vast_api_key'
 _ANY_REGION = 'any'
+logger = sky_logging.init_logger(__name__)
 
 
 @registry.CLOUD_REGISTRY.register
@@ -200,8 +201,21 @@ class Vast(clouds.Cloud):
         del zones, dryrun, cluster_name, num_nodes  # unused
 
         resources = resources.assert_launchable()
-        acc_dict = self.get_accelerators_from_instance_type(
-            resources.instance_type)
+        resolved_offer = resources.resolved_cloud_offer
+        if resolved_offer is not None:
+            if resolved_offer.provider.lower() != 'vast':
+                raise ValueError('Vast resources can only use a Vast resolved '
+                                 'cloud offer.')
+            if resolved_offer.region != region.name:
+                raise ValueError('Resolved Vast offer region does not match '
+                                 'the deployment region.')
+            acc_dict: Optional[Dict[str, Union[int, float]]] = {
+                resolved_offer.accelerator_name:
+                    resolved_offer.accelerator_count
+            }
+        else:
+            acc_dict = self.get_accelerators_from_instance_type(
+                resources.instance_type)
         custom_resources = resources_utils.make_ray_custom_resources_str(
             acc_dict)
 
@@ -251,6 +265,8 @@ class Vast(clouds.Cloud):
             'secure_only': secure_only,
             'reliable_hosts': reliable_hosts,
             'network_tier': network_tier.value,
+            'resolved_shape': resolved_offer is not None,
+            'max_hourly_cost': resources.max_hourly_cost,
             'provision_timeout': provision_timeout,
             'create_instance_kwargs': create_instance_kwargs or {},
         }
@@ -260,7 +276,13 @@ class Vast(clouds.Cloud):
     ) -> 'resources_utils.FeasibleResources':
         """Returns a list of feasible resources for the given resources."""
         # pylint: disable=import-outside-toplevel
+        from sky import resources as resources_lib
         from sky.catalog import vast_catalog
+        from sky.catalog import vast_refresh
+
+        if resources.resolved_cloud_offer is not None:
+            return resources_utils.FeasibleResources([resources], [], None)
+
         datacenter_only = skypilot_config.get_effective_region_config(
             cloud='vast',
             region=resources.region,
@@ -278,6 +300,8 @@ class Vast(clouds.Cloud):
         network_tier = (resources.network_tier or
                         resources_utils.NetworkTier.STANDARD)
 
+        explicit_instance_type = resources.instance_type is not None
+
         def _offer_requirements(instance_type, region):
             return vast_adaptor.get_offer_requirements(
                 instance_type,
@@ -286,6 +310,11 @@ class Vast(clouds.Cloud):
                 datacenter_only=datacenter_only,
                 reliable_hosts=reliable_hosts,
                 network_tier=network_tier,
+                cpus=resources.cpus,
+                memory=resources.memory,
+                use_resource_constraints=not explicit_instance_type,
+                use_spot=resources.use_spot,
+                max_hourly_cost=resources.max_hourly_cost,
             )
 
         def _candidate_regions():
@@ -296,13 +325,17 @@ class Vast(clouds.Cloud):
                 return list(resources.image_id)
             return [None]
 
-        def _is_unscoped_request():
-            return all(
-                vast_adaptor.extract_country_code(region) is None
-                for region in _candidate_regions())
+        def _requested_accelerator_name() -> Optional[str]:
+            if explicit_instance_type:
+                return None
+            accelerators = resources.accelerators
+            if accelerators is None:
+                return None
+            return str(next(iter(accelerators)))
 
         def _admit_live_offers(instance_list, fuzzy_candidate_list):
-            admitted_resources = []
+            admitted_by_shape: Dict[Tuple[str, str, str, int, bool],
+                                    resources_lib.Resources] = {}
             offers_examined = 0
             eligible_offers = 0
             rejection_counts: Dict[str, int] = {}
@@ -327,22 +360,66 @@ class Vast(clouds.Cloud):
                         continue
                     admitted_region = (_ANY_REGION if region is None or
                                        region == _ANY_REGION else region)
-                    admitted_resources.append(
-                        resources.copy(
-                            cloud=Vast(),
-                            instance_type=instance_type,
-                            accelerators=None,
-                            cpus=None,
+                    canonical_accelerator = (
+                        vast_catalog.get_canonical_accelerator_name(
+                            instance_type, _requested_accelerator_name()))
+                    for live_offer in live_result.offers:
+                        actual_instance_type = (
+                            vast_adaptor.build_instance_type_from_offer(
+                                live_offer))
+                        price = vast_adaptor.get_offer_hourly_price(
+                            live_offer, resources.use_spot)
+                        assert price is not None
+                        cpu_count = float(live_offer['cpu_cores'])
+                        memory_gib = float(live_offer['cpu_ram']) / 1024
+                        device_memory_gib = float(live_offer['gpu_ram']) / 1024
+                        num_gpus = int(live_offer['num_gpus'])
+                        resolved_offer = resources_lib.ResolvedCloudOffer(
+                            provider='vast',
+                            instance_type=actual_instance_type,
                             region=admitted_region,
-                        ))
-            if admitted_resources:
+                            accelerator_name=canonical_accelerator,
+                            accelerator_count=num_gpus,
+                            cpu_count=cpu_count,
+                            memory_gib=memory_gib,
+                            device_memory_gib=device_memory_gib,
+                            hourly_price=price,
+                            use_spot=resources.use_spot,
+                        )
+                        admitted_resource = resources.copy(
+                            cloud=Vast(),
+                            instance_type=actual_instance_type,
+                            accelerators={canonical_accelerator: num_gpus},
+                            cpus=None,
+                            memory=None,
+                            region=admitted_region,
+                            _resolved_cloud_offer=resolved_offer,
+                        )
+                        key = (actual_instance_type, admitted_region,
+                               canonical_accelerator, num_gpus,
+                               resources.use_spot)
+                        existing = admitted_by_shape.get(key)
+                        existing_offer = (None if existing is None else
+                                          existing.resolved_cloud_offer)
+                        if (existing_offer is None or
+                                existing_offer.hourly_price > price):
+                            admitted_by_shape[key] = admitted_resource
+            if admitted_by_shape:
+                admitted_resources = list(admitted_by_shape.values())
+
+                def _resolved_price(item: resources_lib.Resources) -> float:
+                    offer = item.resolved_cloud_offer
+                    assert offer is not None
+                    return offer.hourly_price
+
+                admitted_resources.sort(key=_resolved_price)
                 return (resources_utils.FeasibleResources(
                     admitted_resources, fuzzy_candidate_list, None), False)
             diagnostic_keys = ('availability', 'cpu', 'ram', 'vram', 'disk',
                                'gpu', 'country', 'host_policy', 'network',
-                               'malformed')
+                               'price', 'malformed')
             diagnostics = [
-                f'offers examined={offers_examined}',
+                f'offers returned={offers_examined}',
                 f'eligible={eligible_offers}'
             ]
             diagnostics.extend(
@@ -361,20 +438,14 @@ class Vast(clouds.Cloud):
             # Currently, handle a filter on accelerators only.
             accelerators = resources.accelerators
             if accelerators is None:
-                # Return a default instance type
-                default_instance_type = Vast.get_default_instance_type(
-                    cpus=resources.cpus,
-                    memory=resources.memory,
-                    disk_tier=resources.disk_tier,
-                    local_disk=resources.local_disk,
-                    region=resources.region,
-                    zone=resources.zone,
-                    use_spot=resources.use_spot,
-                    max_hourly_cost=resources.max_hourly_cost,
-                    datacenter_only=datacenter_only)
-                if default_instance_type is None:
+                # Catalog rows provide stable GPU identities only. CPU, RAM,
+                # locality, host policy, market, and price are applied live.
+                default_instance_types = (
+                    vast_catalog.get_default_instance_types(
+                        zone=resources.zone))
+                if not default_instance_types:
                     return None, []
-                return [default_instance_type], []
+                return default_instance_types, []
 
             assert len(accelerators) == 1, resources
             acc, acc_count = list(accelerators.items())[0]
@@ -393,29 +464,32 @@ class Vast(clouds.Cloud):
                 datacenter_only=datacenter_only)
 
         try:
+            forced_refresh_failed = False
+            if not explicit_instance_type:
+                try:
+                    vast_refresh.refresh_catalog_for_request(force=False)
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Vast catalog refresh failed before resource '
+                        'lookup; using existing metadata if available.')
             instance_list, fuzzy_candidate_list = _get_catalog_candidates()
-            if instance_list is None:
-                return resources_utils.FeasibleResources([],
-                                                         fuzzy_candidate_list,
-                                                         None)
-            feasible_resources, live_query_failed = _admit_live_offers(
-                instance_list, fuzzy_candidate_list)
-            if (feasible_resources.resources_list or live_query_failed or
-                    not _is_unscoped_request()):
-                return feasible_resources
-
-            # Marketplace offers can change after a catalog sweep. Retry once
-            # after a forced refresh, then let the targeted live diagnostics
-            # describe any remaining capacity mismatch.
-            from sky.catalog import vast_refresh
-            try:
-                refreshed = vast_refresh.refresh_catalog(force=True)
-            except Exception:  # pylint: disable=broad-except
-                return feasible_resources
-            if not refreshed:
-                return feasible_resources
-            annotations.clear_request_level_cache()
-            instance_list, fuzzy_candidate_list = _get_catalog_candidates()
+            if not explicit_instance_type and not instance_list:
+                try:
+                    refreshed = vast_refresh.refresh_catalog_for_request(
+                        force=True)
+                    if not refreshed:
+                        forced_refresh_failed = True
+                except Exception:  # pylint: disable=broad-except
+                    forced_refresh_failed = True
+                    logger.warning('Forced Vast catalog refresh failed for '
+                                   'missing resource metadata.')
+                instance_list, fuzzy_candidate_list = _get_catalog_candidates()
+            if forced_refresh_failed and not instance_list:
+                return resources_utils.FeasibleResources(
+                    [], fuzzy_candidate_list,
+                    'Vast resource metadata is unavailable because the '
+                    'catalog refresh failed. Retry after confirming Vast '
+                    'credentials and service availability.')
             if instance_list is None:
                 return resources_utils.FeasibleResources([],
                                                          fuzzy_candidate_list,

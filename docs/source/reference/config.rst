@@ -2845,25 +2845,40 @@ Example:
 
 Advanced Vast configuration (optional).
 
+SkyPilot uses the catalog only to identify compatible Vast GPU models. It
+selects a concrete offer from the live Vast marketplace immediately before
+provisioning, so catalog prices and regions are planning metadata rather than
+availability guarantees. The live offer is checked against the original task
+constraints: ``cpus: "8+"`` and ``memory: "32+"`` mean minimums, while
+``cpus: "8"`` and ``memory: "32"`` mean exact values. A memory ratio such as
+``memory: "4x"`` requires at least 4 GiB per live vCPU. Omitting CPU or memory
+does not add a CPU or RAM constraint. The selected offer's concrete CPU and
+RAM shape is then recorded for provisioning; a catalog shape never tightens
+the task's flexible constraints.
+
+Vast accelerator aliases first use an exact match. Otherwise SkyPilot accepts
+only an unambiguous case-insensitive match after removing spaces and
+underscores, so similarly named GPUs remain distinct.
+
 .. _config-yaml-vast-datacenter-only:
 
 ``vast.datacenter_only``
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Configure SkyPilot to only consider offers on Vast verified datacenters (optional).
-Internally, this will query Vast with the ``datacenter=true`` and ``hosting_type>=1``
-parameters to filter for professional datacenter-hosted machines. Note some GPUs
-may only be available on non-datacenter offers. This config filters both the catalog
-(during resource planning) and the launch query (during provisioning). This config
-can be overridden per task via :ref:`config flag <config-client-cli-flag>`.
-SkyPilot uses stable catalog instance types for planning, then searches the
-live Vast marketplace immediately before creating an instance. Marketplace
-offer IDs are never stored as SkyPilot instance types.
+Configure SkyPilot to only consider offers on Vast verified datacenters
+(optional). SkyPilot queries Vast with ``datacenter=true`` and then locally
+requires ``hosting_type >= 1`` because Vast SDK 1.5.0 does not expose
+``hosting_type`` as a search field. Note some GPUs may only be available on
+non-datacenter offers. The catalog remains GPU identity metadata; this policy
+is enforced against live offers. This config can be overridden per task via
+:ref:`config flag <config-client-cli-flag>`.
 For a task without an explicit region, the live query can select any matching
 Vast country; catalog regions and prices are planning metadata, not live
 availability guarantees. An explicit Vast region remains a country constraint.
-If an unscoped targeted query has no match, SkyPilot forces one catalog refresh
-and retries before reporting the sanitized live-offer diagnostics.
+SkyPilot performs a request-cached catalog refresh before a live lookup and
+performs at most one targeted forced refresh when requested accelerator
+metadata is absent. It does not retry a live no-match result with relaxed
+requirements.
 
 Default: ``false``
 
@@ -2873,11 +2888,11 @@ Default: ``false``
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 Use a stricter live-offer query intended for production launches (optional).
-When enabled, SkyPilot requires Vast offers to be verified, datacenter-hosted,
-have a reliability score of at least ``0.99``, and advertise at least
-``1000 Mbps`` download bandwidth. This can reduce capacity and increase price.
-It applies only while selecting the live marketplace offer; it does not change
-the stable catalog resource type used during planning.
+It is disabled by default. When enabled, SkyPilot requires a verified,
+datacenter-hosted offer with the configured reliability and download-bandwidth
+limits. When disabled, SkyPilot still explicitly excludes non-rentable and
+external offers, but does not require verification. This can reduce capacity
+and increase price. It applies only while selecting the live marketplace offer.
 
 Default: ``false``
 

@@ -378,6 +378,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     reliable_hosts = config.provider_config.get('reliable_hosts', False)
     network_tier = resources_utils.NetworkTier(
         config.provider_config.get('network_tier', 'standard'))
+    resolved_shape = config.provider_config.get('resolved_shape', False)
+    max_hourly_cost = config.provider_config.get('max_hourly_cost')
 
     def _launch_missing_instances(count: int,
                                   current_head_instance_id: Optional[str],
@@ -398,6 +400,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     secure_only=secure_only,
                     reliable_hosts=reliable_hosts,
                     network_tier=network_tier,
+                    resolved_shape=resolved_shape,
+                    max_hourly_cost=max_hourly_cost,
                     excluded_machine_ids=excluded_machine_ids,
                     private_docker_registry=login_config is not None,
                     login=login_args,

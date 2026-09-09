@@ -4,6 +4,7 @@ import ast
 import csv
 import importlib
 import logging
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -33,10 +34,11 @@ _CATALOG_FIELDS = [
 def _write_catalog(path: Path,
                    *,
                    include_hosting_type: bool = True,
-                   row_count: int = 1) -> None:
+                   row_count: int = 1,
+                   instance_type: str = 'vastv2-1x-A100-81920-4-8192') -> None:
     fields = _CATALOG_FIELDS if include_hosting_type else _CATALOG_FIELDS[:-1]
     row = {
-        'InstanceType': '1x-A100-4-8192',
+        'InstanceType': instance_type,
         'AcceleratorName': 'A100',
         'AcceleratorCount': '1',
         'vCPUs': '4',
@@ -113,7 +115,7 @@ def test_datacenter_filter_fails_closed_without_hosting_type():
 
 def test_fetch_vast_catalog_and_save_catalog_are_reusable(
         monkeypatch, tmp_path):
-    """Catalog refresh retains its broad bucketing query and save contract."""
+    """Catalog refresh keeps raw CPU/RAM and disables SDK hidden defaults."""
     offer = {
         'gpu_name': 'A100',
         'num_gpus': 1,
@@ -135,9 +137,26 @@ def test_fetch_vast_catalog_and_save_catalog_are_reusable(
     fetch_vast.save_catalog(fetch_vast.fetch_vast_catalog(), str(catalog_path))
 
     vast_refresh.validate_catalog(catalog_path)
-    assert client.search_offers.call_args.kwargs['query'] == (
-        'georegion = true chunked = true '
-        'inet_down >= 100 disk_space >= 80')
+    search_kwargs = client.search_offers.call_args.kwargs
+    assert search_kwargs['query'] == (
+        'georegion = true inet_down >= 100 disk_space >= 80')
+    assert search_kwargs['no_default'] is True
+
+
+def test_catalog_instance_type_uses_shared_concrete_offer_builder(monkeypatch):
+    """Catalog and live admission encode concrete Vast shapes identically."""
+    builder = mock.Mock(return_value='vastv2-shared')
+    monkeypatch.setattr(fetch_vast.vast, 'build_instance_type_from_offer',
+                        builder)
+    offer = {
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+    }
+
+    assert fetch_vast.create_instance_type(offer, 81920) == 'vastv2-shared'
+    builder.assert_called_once_with({**offer, 'gpu_ram': 81920})
 
 
 def test_fetch_vast_catalog_keeps_countries_distinct(monkeypatch):
@@ -232,19 +251,42 @@ def test_refresh_catalog_replaces_validated_staged_file(monkeypatch, tmp_path):
     vast_refresh.validate_catalog(catalog_path)
 
 
+def test_recent_legacy_catalog_is_regenerated(monkeypatch, tmp_path):
+    """A fresh legacy-only cache must be regenerated into v2 identities."""
+    catalog_path = tmp_path / 'vast' / 'vms.csv'
+    catalog_path.parent.mkdir()
+    _write_catalog(catalog_path, instance_type='1x-A100-4-8192')
+    monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
+                        lambda _name: str(catalog_path))
+    monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
+    fetch_catalog = mock.Mock(return_value=[{}])
+    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', fetch_catalog)
+    monkeypatch.setattr(fetch_vast, 'save_catalog',
+                        lambda _rows, output: _write_catalog(Path(output)))
+
+    with pytest.raises(ValueError, match='supported vastv2'):
+        vast_refresh.validate_catalog(catalog_path)
+    assert not vast_refresh.catalog_is_fresh(catalog_path)
+    assert vast_refresh.refresh_catalog()
+    fetch_catalog.assert_called_once_with()
+    vast_refresh.validate_catalog(catalog_path)
+
+
 def test_refresh_catalog_logs_fetched_unchanged_record_count(
         monkeypatch, tmp_path, caplog):
     """A fetched-but-identical response logs that no CSV update occurred."""
     catalog_path = tmp_path / 'vast' / 'vms.csv'
     catalog_path.parent.mkdir()
     _write_catalog(catalog_path)
+    os.utime(catalog_path, ns=(1, 1))
+    original_mtime = catalog_path.stat().st_mtime_ns
     monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
                         lambda _name: str(catalog_path))
     monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
     monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda: [{}])
     monkeypatch.setattr(fetch_vast, 'save_catalog',
                         lambda _rows, output: _write_catalog(Path(output)))
-    replace_catalog = mock.Mock()
+    replace_catalog = mock.Mock(wraps=vast_refresh.os.replace)
     monkeypatch.setattr(vast_refresh.os, 'replace', replace_catalog)
 
     refresh_logger = logging.getLogger('sky.catalog.vast_refresh')
@@ -258,7 +300,9 @@ def test_refresh_catalog_logs_fetched_unchanged_record_count(
     assert 'Vast catalog fetched but CSV is unchanged' in caplog.text
     assert 'records_before=1' in caplog.text
     assert 'records_fetched=1' in caplog.text
-    replace_catalog.assert_not_called()
+    replace_catalog.assert_called_once()
+    assert catalog_path.stat().st_mtime_ns > original_mtime
+    assert vast_refresh.catalog_is_fresh(catalog_path)
 
 
 def test_refresh_catalog_logs_updated_record_counts(monkeypatch, tmp_path,
@@ -303,6 +347,24 @@ def test_refresh_catalog_keeps_valid_file_on_fetch_failure(
                         (_ for _ in ()).throw(RuntimeError('offline')))
 
     assert vast_refresh.refresh_catalog()
+    assert catalog_path.read_text(encoding='utf-8') == original
+
+
+def test_forced_refresh_reports_failure_with_valid_stale_catalog(
+        monkeypatch, tmp_path):
+    """A forced refresh cannot claim success when provider fetching fails."""
+    catalog_path = tmp_path / 'vast' / 'vms.csv'
+    catalog_path.parent.mkdir()
+    _write_catalog(catalog_path)
+    original = catalog_path.read_text(encoding='utf-8')
+    monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
+                        lambda _name: str(catalog_path))
+    monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
+    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda:
+                        (_ for _ in ()).throw(RuntimeError('offline')))
+
+    with pytest.raises(RuntimeError, match='no valid existing catalog'):
+        vast_refresh.refresh_catalog(force=True)
     assert catalog_path.read_text(encoding='utf-8') == original
 
 

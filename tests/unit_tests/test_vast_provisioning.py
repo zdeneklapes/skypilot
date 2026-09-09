@@ -89,13 +89,14 @@ def _mock_vast_sdk(monkeypatch):
         'geolocation': 'US',
         'dph_total': 0.4,
         'reliability': 0.99,
-        'verified': True,
+        'verification': 'verified',
         'datacenter': True,
         'hosting_type': 1,
         'inet_down': 1000,
         'inet_up': 1000,
         'rentable': True,
         'rented': False,
+        'external': False,
     }]
     sdk.create_instance.return_value = {'new_contract': '3'}
     sdk.show_instance.return_value = {
@@ -119,6 +120,8 @@ def test_vast_template_persists_network_tier(tmp_path):
             'secure_only': False,
             'reliable_hosts': False,
             'network_tier': 'best',
+            'resolved_shape': True,
+            'max_hourly_cost': 1.5,
             'provision_timeout': 1800,
             'docker_login_config': None,
             'create_instance_kwargs': {},
@@ -143,6 +146,8 @@ def test_vast_template_persists_network_tier(tmp_path):
 
     config = yaml_utils.read_yaml(str(output_path))
     assert config['provider']['network_tier'] == 'best'
+    assert config['provider']['resolved_shape'] is True
+    assert config['provider']['max_hourly_cost'] == 1.5
 
 
 def test_launch_best_network_tier_filters_symmetric_bandwidth(monkeypatch):
@@ -186,6 +191,68 @@ def test_launch_extracts_country_from_raw_catalog_region(monkeypatch):
     assert 'geolocation=FR' in query
     assert 'geolocation=EU' not in query
     assert 'cpu_cores>=4' in query
+
+
+def test_resolved_launch_requeries_exact_shape_without_hidden_defaults(
+        monkeypatch):
+    """Resolved provisioning accepts only the selected CPU/RAM shape."""
+    sdk = _mock_vast_sdk(monkeypatch)
+    sdk.search_offers.return_value[0].update({
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+        'disk_space': 200,
+        'dph_total': .7,
+    })
+    sdk.show_instance.return_value.update({
+        'cpu_cores': 16,
+        'cpu_ram': 49152,
+    })
+
+    result = vast_utils.launch(
+        name='test-head',
+        instance_type='vastv2-1x-A100-81920-16-49152',
+        region='US',
+        disk_size=200,
+        image_name='vastai/base:0.0.2',
+        ports=None,
+        preemptible=False,
+        secure_only=False,
+        resolved_shape=True,
+        max_hourly_cost=.8,
+    )
+
+    assert result == '3'
+    query = sdk.search_offers.call_args.kwargs['query']
+    assert 'cpu_cores=16' in query
+    assert 'cpu_ram>=48' in query
+    assert sdk.search_offers.call_args.kwargs == {
+        'query': query,
+        'order': 'dph_total',
+        'type': 'on-demand',
+        'storage': 200,
+        'no_default': True,
+    }
+
+
+def test_resolved_launch_rejects_disappeared_exact_shape(monkeypatch):
+    """A stale resolved shape raises the typed failover capacity error."""
+    sdk = _mock_vast_sdk(monkeypatch)
+    sdk.search_offers.return_value[0]['cpu_cores'] = 32
+
+    with pytest.raises(exceptions.VastOfferUnavailableError):
+        vast_utils.launch(
+            name='test-head',
+            instance_type='vastv2-1x-A100-81920-16-49152',
+            region='US',
+            disk_size=30,
+            image_name='vastai/base:0.0.2',
+            ports=None,
+            preemptible=False,
+            secure_only=False,
+            resolved_shape=True,
+        )
+
+    sdk.create_instance.assert_not_called()
 
 
 @pytest.mark.parametrize('registry_key', ['login', 'image_login'])
