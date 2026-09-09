@@ -2428,7 +2428,7 @@ def get(request_id: server_common.RequestId[T]) -> T:
     """
     response = server_common.make_authenticated_request(
         'GET',
-        f'/api/get?request_id={request_id}',
+        f'/api/get?request_id={request_id}&return_error_payload=true',
         retry=False,
         timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
                  None))

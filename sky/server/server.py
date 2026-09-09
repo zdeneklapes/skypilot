@@ -103,6 +103,7 @@ from sky.utils import context
 from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
+from sky.utils import debug_dump_helpers
 from sky.utils import debug_utils
 from sky.utils import env_options
 from sky.utils import interactive_utils
@@ -1624,7 +1625,8 @@ async def validate(validate_body: payloads.ValidateBody) -> None:
     # in each step, which may be an expensive operation. We should consolidate
     # these into a single call or have a TTL cache for (task, admin_policy)
     # pairs.
-    logger.debug(f'Validating tasks: {validate_body.dag}')
+    logger.debug('Validating tasks: %s',
+                 debug_dump_helpers.redact_task_yaml(validate_body.dag))
 
     context.initialize()
     ctx = context.get()
@@ -2594,8 +2596,10 @@ async def get_expanded_request_id(request_id: str,
 
 # === API server related APIs ===
 @app.get('/api/get')
-async def api_get(request: fastapi.Request,
-                  request_id: str) -> payloads.RequestPayload:
+async def api_get(
+        request: fastapi.Request,
+        request_id: str,
+        return_error_payload: bool = False) -> payloads.RequestPayload:
     """Gets a request with a given request ID prefix."""
     # Validate request_id prefix matches a single request, scoped to the
     # caller so a non-admin cannot read another user's request.
@@ -2634,6 +2638,8 @@ async def api_get(request: fastapi.Request,
     # would make the client retry /api/get itself forever.
     request_error = request_task.get_error()
     if request_error is not None:
+        if return_error_payload:
+            return request_task.encode()
         raise fastapi.HTTPException(status_code=500,
                                     detail=request_task.encode().model_dump())
     if request_task.should_retry:
@@ -2647,6 +2653,8 @@ async def api_get(request: fastapi.Request,
                 f'Request {request_id!r} was interrupted by an API server '
                 'restart and will not be resumed. Please re-submit the '
                 'original request.'))
+        if return_error_payload:
+            return request_task.encode()
         raise fastapi.HTTPException(status_code=500,
                                     detail=request_task.encode().model_dump())
     return request_task.encode()
@@ -3152,7 +3160,8 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
             raise fastapi.HTTPException(status_code=401,
                                         detail='Authentication required')
 
-    logger.debug(f'Health endpoint: request.state.auth_user = {user}')
+    logger.debug('Health endpoint: auth_user_id=%s',
+                 user.id if user is not None else None)
 
     # Get latest version from cache (returns None for dev versions
     # or if not available)

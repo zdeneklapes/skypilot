@@ -372,3 +372,53 @@ async def test_get_raises_typed_error_from_500_detail():
     decoded_payload = mock_decode.call_args[0][0]
     assert decoded_payload.request_id == 'req-1'
     assert decoded_payload.status == 'FAILED'
+
+
+@pytest.mark.asyncio
+async def test_get_raises_typed_error_from_opt_in_payload():
+    """get() preserves typed errors from opt-in HTTP 200 payloads."""
+    payload = {
+        'request_id': 'req-1',
+        'name': 'launch',
+        'entrypoint': '',
+        'request_body': '',
+        'status': 'FAILED',
+        'created_at': 0.0,
+        'user_id': 'user',
+        'return_value': 'null',
+        'error': 'null',
+        'pid': None,
+        'schedule_type': 'long',
+    }
+
+    class _FakeResponse:
+        status = 200
+
+        async def json(self):
+            return payload
+
+        async def text(self):
+            return 'error body'
+
+        def close(self):
+            pass
+
+    async def fake_request(session, method, path, **kwargs):
+        assert path == ('/api/get?request_id=req-1&'
+                        'return_error_payload=true')
+        return _FakeResponse()
+
+    decoded = mock.MagicMock()
+    decoded.get_error.return_value = {
+        'object': exceptions.StorageSpecError('bad storage spec')
+    }
+
+    with mock.patch(
+            'sky.client.sdk_async.server_common.'
+            'make_authenticated_request_async',
+            side_effect=fake_request), \
+         mock.patch(
+             'sky.client.sdk_async.requests_lib.Request.decode',
+             return_value=decoded):
+        with pytest.raises(exceptions.StorageSpecError, match='bad storage'):
+            await sdk_async.get('req-1')

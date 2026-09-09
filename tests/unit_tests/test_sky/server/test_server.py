@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import threading
@@ -195,6 +196,65 @@ async def test_validate():
         # Wait for validation to complete
         await validation_task
         assert validation_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_validate_redacts_debug_log_secrets(caplog):
+    """Validate debug logging never writes raw task secret values."""
+    mock_dag = mock.MagicMock()
+    mock_validate_body = mock.MagicMock()
+    mock_validate_body.dag = ('secrets:\n'
+                              '  registry_password: registry-password\n'
+                              'envs:\n'
+                              '  API_TOKEN: api-token\n')
+    mock_validate_body.request_options = {}
+
+    server.logger.addHandler(caplog.handler)
+    try:
+        with mock.patch(
+                'sky.server.server.dag_utils.load_chain_dag_from_yaml_str',
+                return_value=mock_dag), \
+             mock.patch('sky.server.server.admin_policy_utils.apply',
+                        return_value=(mock_dag, config_utils.Config())), \
+             mock.patch.object(mock_dag, 'validate'), \
+             caplog.at_level(logging.DEBUG, logger=server.logger.name):
+            await server.validate(mock_validate_body)
+    finally:
+        server.logger.removeHandler(caplog.handler)
+
+    assert 'registry-password' not in caplog.text
+    assert 'api-token' not in caplog.text
+    assert '<redacted>' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_health_debug_log_excludes_user_password(caplog):
+    """Health debug logging exposes only the authenticated user identifier."""
+    request = mock.MagicMock(spec=fastapi.Request)
+    request.state.auth_user = models.User(id='user-id',
+                                          name='private-name',
+                                          password='password-hash')
+    request.state.anonymous_user = False
+
+    server.logger.addHandler(caplog.handler)
+    try:
+        with mock.patch(
+                'sky.server.server.version_check.get_latest_version_for_current',
+                return_value=None), \
+             mock.patch('sky.server.server.common.get_skypilot_version_on_disk',
+                        return_value='test'), \
+             mock.patch('sky.server.server.server_config.load_external_proxy_config',
+                        return_value=mock.MagicMock(enabled=False)), \
+             mock.patch('sky.server.server.rbac.restrict_config_to_admins',
+                        return_value=False), \
+             caplog.at_level(logging.DEBUG, logger=server.logger.name):
+            await server.health(request)
+    finally:
+        server.logger.removeHandler(caplog.handler)
+
+    assert 'user-id' in caplog.text
+    assert 'private-name' not in caplog.text
+    assert 'password-hash' not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -945,6 +1005,31 @@ def test_api_get_interrupted_request_returns_terminal_error(monkeypatch):
     assert isinstance(error['object'], exceptions.RequestInterruptedError)
 
 
+def test_api_get_error_payload_opt_in_returns_stored_error(monkeypatch):
+    """The opt-in transport returns stored terminal errors with HTTP 200."""
+    from fastapi.testclient import TestClient
+
+    from sky import exceptions
+    from sky.server.requests import payloads
+    from sky.server.requests import requests as requests_lib
+
+    request = _make_interrupted_request(with_error=True)
+    _mount_api_get_request(monkeypatch, request)
+
+    response = TestClient(server.app).get('/api/get',
+                                          params={
+                                              'request_id': 'interrupted-req',
+                                              'return_error_payload': 'true',
+                                          })
+
+    assert response.status_code == 200
+    decoded = requests_lib.Request.decode(
+        payloads.RequestPayload(**response.json()))
+    error = decoded.get_error()
+    assert error is not None
+    assert isinstance(error['object'], exceptions.RequestInterruptedError)
+
+
 def test_api_get_interrupted_request_without_error_synthesizes_error(
         monkeypatch):
     """Interrupted rows without a stored error get a synthesized one.
@@ -969,6 +1054,31 @@ def test_api_get_interrupted_request_without_error_synthesizes_error(
     assert response.status_code == 500
     payload = payloads.RequestPayload(**response.json()['detail'])
     decoded = requests_lib.Request.decode(payload)
+    error = decoded.get_error()
+    assert error is not None
+    assert isinstance(error['object'], exceptions.RequestInterruptedError)
+
+
+def test_api_get_error_payload_opt_in_synthesizes_terminal_error(monkeypatch):
+    """The opt-in transport returns errors synthesized from legacy rows."""
+    from fastapi.testclient import TestClient
+
+    from sky import exceptions
+    from sky.server.requests import payloads
+    from sky.server.requests import requests as requests_lib
+
+    request = _make_interrupted_request(with_error=False)
+    _mount_api_get_request(monkeypatch, request)
+
+    response = TestClient(server.app).get('/api/get',
+                                          params={
+                                              'request_id': 'interrupted-req',
+                                              'return_error_payload': 'true',
+                                          })
+
+    assert response.status_code == 200
+    decoded = requests_lib.Request.decode(
+        payloads.RequestPayload(**response.json()))
     error = decoded.get_error()
     assert error is not None
     assert isinstance(error['object'], exceptions.RequestInterruptedError)

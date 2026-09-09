@@ -1414,3 +1414,32 @@ def test_get_interrupted_request_raises_request_interrupted_error():
 
         with pytest.raises(exceptions.RequestInterruptedError):
             client_sdk.get('interrupted-req')
+
+        assert mock_make_request.call_args.args[1] == (
+            '/api/get?request_id=interrupted-req&return_error_payload=true')
+
+
+def test_get_raises_typed_error_from_opt_in_payload():
+    """sdk.get() preserves typed errors from opt-in HTTP 200 payloads."""
+    from sky import exceptions
+    from sky.server.requests import payloads as requests_payloads
+    from sky.server.requests import requests as requests_lib
+
+    request = requests_lib.Request(request_id='failed-req',
+                                   name='sky.launch',
+                                   entrypoint=_interrupted_entrypoint,
+                                   request_body=requests_payloads.RequestBody(),
+                                   status=requests_lib.RequestStatus.FAILED,
+                                   created_at=0.0,
+                                   user_id='user-123')
+    request.set_error(exceptions.StorageSpecError('bad storage spec'))
+
+    with mock.patch('sky.server.common.make_authenticated_request'
+                   ) as mock_make_request:
+        mock_response = mock.Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = request.encode().model_dump()
+        mock_make_request.return_value = mock_response
+
+        with pytest.raises(exceptions.StorageSpecError, match='bad storage'):
+            client_sdk.get('failed-req')

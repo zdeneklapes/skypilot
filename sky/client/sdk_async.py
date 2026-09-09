@@ -95,7 +95,7 @@ async def get(request_id: str) -> Any:
         response = await server_common.make_authenticated_request_async(
             session,
             'GET',
-            f'/api/get?request_id={request_id}',
+            f'/api/get?request_id={request_id}&return_error_payload=true',
             retry=False,
             timeout=aiohttp.ClientTimeout(
                 total=None,
