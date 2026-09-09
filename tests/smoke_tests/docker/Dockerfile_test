@@ -152,13 +152,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     echo 'export PATH="$PATH:$HOME/.local/bin"' >> ~/.bashrc
 
 # Install packages using conda environment
+ARG SKYPILOT_EXTRAS=all
 RUN source ~/miniconda3/etc/profile.d/conda.sh && \
     conda activate base && \
     export PATH="$PATH:$HOME/.local/bin" && \
     uv pip uninstall skypilot --system && \
     uv pip install --prerelease=allow "azure-cli>=2.65.0,<2.87.0" --system && \
     uv pip install -r requirements-dev.txt --system && \
-    uv pip install -e ".[all]" --system && \
+    uv pip install -e ".[${SKYPILOT_EXTRAS}]" --system && \
     # Install httpx with SOCKS support for proxy environments - necessary when system has proxy enabled
     uv pip install httpx[socks] --system
 
