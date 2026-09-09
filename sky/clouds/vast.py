@@ -384,7 +384,9 @@ class Vast(clouds.Cloud):
                 use_spot=resources.use_spot,
                 cpus=resources.cpus,
                 local_disk=resources.local_disk,
-                region=resources.region,
+                # Vast catalog regions identify raw localities, while
+                # resources.region is a live marketplace country constraint.
+                region=None,
                 zone=resources.zone,
                 memory=resources.memory,
                 max_hourly_cost=resources.max_hourly_cost,

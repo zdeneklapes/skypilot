@@ -119,9 +119,11 @@ machine advance. "Running" at the provider layer does not imply a running job.
   SkyPilot bootstrap via the offer's onstart script, independent of the image
   entrypoint. Feasibility uses the same targeted live-offer requirements:
   unscoped tasks use the internal ``any`` placement sentinel, while an explicit
-  region remains a country constraint. Stable catalog regions and prices are
-  advisory metadata only; an unscoped no-match forces one catalog refresh and
-  retries once before the capacity diagnostic is returned. Vast catalog
+  region remains a country constraint. Catalog locality strings are advisory
+  metadata and must not eliminate an otherwise compatible instance type before
+  live admission. Stable catalog regions and prices are advisory metadata only;
+  an unscoped no-match forces one catalog refresh and retries once before the
+  capacity diagnostic is returned. Vast catalog
   instance types encode GPU model, count, per-device VRAM, CPU, and host RAM,
   so a live query can never exchange a lower-memory GPU variant for a cheaper
   one. Legacy instance types without a VRAM identity are rejected when the

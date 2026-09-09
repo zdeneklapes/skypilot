@@ -527,6 +527,57 @@ def test_vast_explicit_country_does_not_require_a_static_catalog_region():
                                                             None)
 
 
+@pytest.mark.parametrize(
+    'offer_region, expected_instance_types, expected_hint',
+    [
+        ('Prague, CZ, EU', [_A100_INSTANCE_TYPE], None),
+        ('Paris, FR, EU', [], 'country=1'),
+    ],
+)
+def test_vast_country_constraint_bypasses_catalog_locality(
+        monkeypatch, offer_region, expected_instance_types, expected_hint):
+    """Country-form regions must bypass catalog locality labels.
+
+    Live admission must still reject offers outside the requested country.
+    """
+    catalog_df = pd.read_csv(io.StringIO(_VALID_VAST_CATALOG_CSV))
+    catalog_df['Region'] = 'Prague, CZ, EU'
+    monkeypatch.setattr(vast_catalog, '_df', catalog_df)
+    annotations.clear_request_level_cache()
+
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'id': 1,
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 4,
+        'cpu_ram': 8192,
+        'disk_space': 64,
+        'geolocation': offer_region,
+        'rentable': True,
+        'rented': False,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(
+            cloud=vast_cloud.Vast(),
+            accelerators={'A100-80GB': 1},
+            region='Czechia, CZ, EU',
+            disk_size=64,
+        ))
+
+    assert [resource.instance_type for resource in result.resources_list
+           ] == expected_instance_types
+    assert 'geolocation=CZ' in client.search_offers.call_args.kwargs['query']
+    if expected_hint is None:
+        assert result.hint is None
+    else:
+        assert result.hint is not None
+        assert expected_hint in result.hint
+
+
 def test_vast_live_admission_uses_any_for_unscoped_marketplace_capacity(
         monkeypatch):
     """Unscoped Vast capacity may use live offers outside catalog locations."""
