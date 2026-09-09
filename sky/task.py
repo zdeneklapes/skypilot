@@ -199,14 +199,13 @@ def _with_docker_login_config(
         envs[key] = value.get_secret_value()
     docker_login_config = docker_utils.DockerLoginConfig.from_env_vars(envs)
 
+    missing_docker_image = False
+
     def _add_docker_login_config(resources: 'resources_lib.Resources'):
+        nonlocal missing_docker_image
         docker_image = resources.extract_docker_image()
         if docker_image is None:
-            logger.warning(f'{colorama.Fore.YELLOW}Docker login configs '
-                           f'{", ".join(constants.DOCKER_LOGIN_ENV_VARS)} '
-                           'are provided, but no docker image is specified '
-                           'in `image_id`. The login configs will be '
-                           f'ignored.{colorama.Style.RESET_ALL}')
+            missing_docker_image = True
             return resources
         # If docker image comes from the 'docker' key in image_id dict,
         # don't overwrite image_id, just attach login config.
@@ -222,6 +221,13 @@ def _with_docker_login_config(
     new_resources = []
     for r in resources:
         new_resources.append(_add_docker_login_config(r))
+    if missing_docker_image:
+        logger.warning(
+            f'{colorama.Fore.YELLOW}Docker login configs '
+            f'{", ".join(sorted(constants.DOCKER_LOGIN_ENV_VARS))} '
+            'are provided, but the resources currently have no Docker image '
+            'in `image_id`. The login configs are ignored unless a Docker '
+            f'image is applied later.{colorama.Style.RESET_ALL}')
     return type(resources)(new_resources)
 
 

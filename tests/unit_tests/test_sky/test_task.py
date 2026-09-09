@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 import tempfile
 from unittest import mock
@@ -678,6 +679,53 @@ def test_docker_login_credentials_are_provisioning_only():
         task_obj.runtime_envs_and_secrets)
 
     assert runtime_envs == {'APP_SECRET': 'application-secret'}
+    resource = next(iter(task_obj.resources))
+    assert resource.docker_login_config is not None
+    assert resource.docker_login_config.server == 'registry.example.com'
+
+
+def test_docker_login_config_missing_image_warns_once(caplog):
+    """A collection with image-less alternatives emits one Docker warning."""
+    docker_envs = {
+        'SKYPILOT_DOCKER_USERNAME': 'registry-user',
+        'SKYPILOT_DOCKER_SERVER': 'registry.example.com',
+        'SKYPILOT_DOCKER_PASSWORD': 'registry-password',
+    }
+    resources = [
+        resources_lib.Resources(cpus='2+'),
+        resources_lib.Resources(memory='4+')
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='sky.task'):
+        updated_resources = task._with_docker_login_config(  # pylint: disable=protected-access
+            resources, docker_envs, {})
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if 'resources currently have no Docker image' in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert ('SKYPILOT_DOCKER_PASSWORD, SKYPILOT_DOCKER_SERVER, '
+            'SKYPILOT_DOCKER_USERNAME') in warnings[0]
+    assert all(
+        resource.docker_login_config is None for resource in updated_resources)
+
+
+def test_docker_login_config_applies_after_image_override(caplog):
+    """A later Docker image override attaches retained login credentials."""
+    task_obj = task.Task(name='test-docker-later-image',
+                         run='echo hello',
+                         envs={
+                             'SKYPILOT_DOCKER_USERNAME': 'registry-user',
+                             'SKYPILOT_DOCKER_SERVER': 'registry.example.com',
+                             'SKYPILOT_DOCKER_PASSWORD': 'registry-password',
+                         })
+    with caplog.at_level(logging.WARNING, logger='sky.task'):
+        task_obj.set_resources(resources_lib.Resources())
+    task_obj.set_resources_override(
+        {'image_id': 'docker:registry.example.com/team/image:latest'})
+
     resource = next(iter(task_obj.resources))
     assert resource.docker_login_config is not None
     assert resource.docker_login_config.server == 'registry.example.com'
