@@ -388,13 +388,19 @@ def refresh_vast_catalog_event():
     from sky.catalog import vast_refresh
 
     logger.info('=== Refreshing Vast catalog ===')
-    vast_refresh.refresh_catalog()
+    catalog_available = vast_refresh.refresh_catalog()
     interval = skypilot_config.get_nested(
         ('daemons', 'vast-catalog-refresh-daemon', 'interval_seconds'),
         server_constants.VAST_CATALOG_REFRESH_DAEMON_INTERVAL_SECONDS)
-    logger.info(
-        'Vast catalog refreshed. Sleeping %s seconds for the next '
-        'refresh...', interval)
+    if catalog_available:
+        logger.info(
+            'Vast catalog refresh cycle completed. Sleeping %s '
+            'seconds for the next refresh...', interval)
+    else:
+        logger.warning(
+            'Vast catalog refresh cycle skipped because Vast '
+            'credentials are unavailable. Sleeping %s seconds '
+            'for the next refresh...', interval)
     time.sleep(interval)
 
 

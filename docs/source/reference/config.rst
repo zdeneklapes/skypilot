@@ -3158,6 +3158,9 @@ Valid daemon names are:
 
 ``log_level``
     Log level to set for the daemon. Valid values are ``DEBUG``, ``INFO`` and ``WARNING``.
+    The Vast catalog refresh daemon reports its refresh outcome at ``INFO``:
+    skipped because the local CSV is fresh, fetched but unchanged, or updated
+    with the record counts before and after the refresh.
 
 ``interval_seconds``
     Refresh interval for ``vast-catalog-refresh-daemon``. Default: ``1200``
@@ -3173,6 +3176,7 @@ Valid daemon names are:
     managed-job-status-refresh-daemon:
       log_level: WARNING
     vast-catalog-refresh-daemon:
+      log_level: INFO
       interval_seconds: 1200 # Refresh the Vast catalog every 20 minutes
 
 .. _config-yaml-metrics:

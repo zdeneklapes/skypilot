@@ -3,6 +3,7 @@
 import ast
 import csv
 import importlib
+import logging
 from pathlib import Path
 from unittest import mock
 
@@ -29,7 +30,10 @@ _CATALOG_FIELDS = [
 ]
 
 
-def _write_catalog(path: Path, *, include_hosting_type: bool = True) -> None:
+def _write_catalog(path: Path,
+                   *,
+                   include_hosting_type: bool = True,
+                   row_count: int = 1) -> None:
     fields = _CATALOG_FIELDS if include_hosting_type else _CATALOG_FIELDS[:-1]
     row = {
         'InstanceType': '1x-A100-4-8192',
@@ -46,7 +50,11 @@ def _write_catalog(path: Path, *, include_hosting_type: bool = True) -> None:
     with path.open('w', encoding='utf-8', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        writer.writerow({field: row[field] for field in fields})
+        for index in range(row_count):
+            row_for_index = dict(row)
+            if index > 0:
+                row_for_index['Region'] = f'City {index}, FR, EU'
+            writer.writerow({field: row_for_index[field] for field in fields})
 
 
 @pytest.fixture(autouse=True)
@@ -216,12 +224,69 @@ def test_refresh_catalog_replaces_validated_staged_file(monkeypatch, tmp_path):
     monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
                         lambda _name: str(catalog_path))
     monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
-    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda: object())
+    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda: [{}])
     monkeypatch.setattr(fetch_vast, 'save_catalog',
                         lambda _rows, output: _write_catalog(Path(output)))
 
     assert vast_refresh.refresh_catalog()
     vast_refresh.validate_catalog(catalog_path)
+
+
+def test_refresh_catalog_logs_fetched_unchanged_record_count(
+        monkeypatch, tmp_path, caplog):
+    """A fetched-but-identical response logs that no CSV update occurred."""
+    catalog_path = tmp_path / 'vast' / 'vms.csv'
+    catalog_path.parent.mkdir()
+    _write_catalog(catalog_path)
+    monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
+                        lambda _name: str(catalog_path))
+    monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
+    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda: [{}])
+    monkeypatch.setattr(fetch_vast, 'save_catalog',
+                        lambda _rows, output: _write_catalog(Path(output)))
+    replace_catalog = mock.Mock()
+    monkeypatch.setattr(vast_refresh.os, 'replace', replace_catalog)
+
+    refresh_logger = logging.getLogger('sky.catalog.vast_refresh')
+    refresh_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=refresh_logger.name):
+            assert vast_refresh.refresh_catalog(force=True)
+    finally:
+        refresh_logger.removeHandler(caplog.handler)
+
+    assert 'Vast catalog fetched but CSV is unchanged' in caplog.text
+    assert 'records_before=1' in caplog.text
+    assert 'records_fetched=1' in caplog.text
+    replace_catalog.assert_not_called()
+
+
+def test_refresh_catalog_logs_updated_record_counts(monkeypatch, tmp_path,
+                                                    caplog):
+    """A changed provider response logs the old and new CSV record counts."""
+    catalog_path = tmp_path / 'vast' / 'vms.csv'
+    catalog_path.parent.mkdir()
+    _write_catalog(catalog_path)
+    monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
+                        lambda _name: str(catalog_path))
+    monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
+    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda: [{}, {}])
+    monkeypatch.setattr(
+        fetch_vast, 'save_catalog',
+        lambda _rows, output: _write_catalog(Path(output), row_count=2))
+
+    refresh_logger = logging.getLogger('sky.catalog.vast_refresh')
+    refresh_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=refresh_logger.name):
+            assert vast_refresh.refresh_catalog(force=True)
+    finally:
+        refresh_logger.removeHandler(caplog.handler)
+
+    assert 'Vast catalog CSV updated' in caplog.text
+    assert 'records_before=1' in caplog.text
+    assert 'records_fetched=2' in caplog.text
+    assert 'records_after=2' in caplog.text
 
 
 def test_refresh_catalog_keeps_valid_file_on_fetch_failure(
@@ -258,7 +323,7 @@ def test_refresh_catalog_force_bypasses_fresh_catalog(monkeypatch, tmp_path):
     monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
                         lambda _name: str(catalog_path))
     monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
-    fetch_catalog = mock.Mock(return_value=object())
+    fetch_catalog = mock.Mock(return_value=[{}])
     monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', fetch_catalog)
     monkeypatch.setattr(fetch_vast, 'save_catalog',
                         lambda _rows, output: _write_catalog(Path(output)))
