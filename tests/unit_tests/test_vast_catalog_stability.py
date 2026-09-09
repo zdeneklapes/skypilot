@@ -3,7 +3,8 @@
 import importlib.util
 import io
 import sys
-from typing import List
+import types
+from typing import Any, Dict, List
 from unittest import mock
 
 import pandas as pd
@@ -12,6 +13,7 @@ import pytest
 from sky import clouds
 from sky import exceptions
 from sky.adaptors import vast as vast_adaptor
+from sky.backends import backend_utils
 from sky.catalog import common
 from sky.catalog import vast_catalog
 from sky.catalog import vast_refresh
@@ -23,12 +25,17 @@ from sky.utils import resources_utils
 
 _A100_INSTANCE_TYPE = 'vastv2-1x-A100-81920-4-8192'
 _RTX_A6000_INSTANCE_TYPE = 'vastv2-1x-RTX_A6000-49152-4-8192'
+_STALE_A100_INSTANCE_TYPE = 'vastv2-1x-A100_PCIE-81920-32-65536'
 
 _VALID_VAST_CATALOG_CSV = """InstanceType,AcceleratorName,AcceleratorCount,vCPUs,MemoryGiB,GpuInfo,Price,SpotPrice,Region
 1x-A100-4-8192,A100,1,4,8,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}\",0.8,0.8,any
 1x-RTX_A6000-4-8192,RTXA6000,1,4,8,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 49152}}]}\",0.8,0.8,any
 vastv2-1x-A100-81920-4-8192,A100-80GB,1,4,8,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}\",0.8,0.8,any
 vastv2-1x-RTX_A6000-49152-4-8192,RTXA6000,1,4,8,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 49152}}]}\",0.8,0.8,any
+"""
+
+_STALE_VAST_CATALOG_CSV = """InstanceType,AcceleratorName,AcceleratorCount,vCPUs,MemoryGiB,GpuInfo,Price,SpotPrice,Region
+vastv2-1x-A100_PCIE-81920-32-65536,A100-80GB,1,32,64,\"{'Gpus': [{'MemoryInfo': {'SizeInMiB': 81920}}]}\",1.0,1.0,any
 """
 
 
@@ -118,6 +125,59 @@ def test_vast_catalog_reuses_snapshot_within_request(monkeypatch):
     annotations.clear_request_level_cache()
     assert vast_catalog._catalog_df().iloc[0]["AcceleratorName"] == "A100"
     assert calls == []
+
+
+def test_v2_metadata_survives_catalog_row_removal(monkeypatch):
+    """A persisted v2 type keeps its encoded metadata after refresh removal."""
+    monkeypatch.setattr(vast_catalog, '_df',
+                        pd.read_csv(io.StringIO(_STALE_VAST_CATALOG_CSV)))
+    annotations.clear_request_level_cache()
+
+    assert vast_cloud.Vast().instance_type_exists(_STALE_A100_INSTANCE_TYPE)
+
+    monkeypatch.setattr(vast_catalog, '_df',
+                        pd.read_csv(io.StringIO(_VALID_VAST_CATALOG_CSV)))
+    annotations.clear_request_level_cache()
+
+    assert vast_catalog.get_vcpus_mem_from_instance_type(
+        _STALE_A100_INSTANCE_TYPE) == (32, 64)
+    assert vast_catalog.get_accelerators_from_instance_type(
+        _STALE_A100_INSTANCE_TYPE) == {
+            'A100 PCIE': 1
+        }
+    assert not vast_cloud.Vast().instance_type_exists(_STALE_A100_INSTANCE_TYPE)
+    with pytest.raises(ValueError, match='No instance type 1x-A100-32-65536'):
+        vast_catalog.get_vcpus_mem_from_instance_type('1x-A100-32-65536')
+    with pytest.raises(ValueError, match='Invalid Vast instance type'):
+        vast_catalog.get_vcpus_mem_from_instance_type('vastv2-invalid')
+    with pytest.raises(ValueError, match='not found'):
+        vast_catalog.get_hourly_cost(_STALE_A100_INSTANCE_TYPE)
+
+
+def test_status_record_survives_v2_catalog_row_removal(monkeypatch):
+    """Status formatting keeps saved V2 handles visible after refresh removal."""
+    monkeypatch.setattr(vast_catalog, '_df',
+                        pd.read_csv(io.StringIO(_STALE_VAST_CATALOG_CSV)))
+    annotations.clear_request_level_cache()
+    resource = Resources(cloud=vast_cloud.Vast(),
+                         instance_type=_STALE_A100_INSTANCE_TYPE)
+
+    monkeypatch.setattr(vast_catalog, '_df',
+                        pd.read_csv(io.StringIO(_VALID_VAST_CATALOG_CSV)))
+    annotations.clear_request_level_cache()
+    record: Dict[str, Any] = {
+        'handle': types.SimpleNamespace(launched_resources=resource,
+                                        launched_nodes=1,
+                                        cached_cluster_info=None)
+    }
+
+    backend_utils._update_records_with_handle_info([record],
+                                                   summary_response=True)
+
+    assert record['resources_str'].startswith('1x(gpus=A100 PCIE:1, ')
+    assert 'cpus=32' in record['resources_str_full']
+    assert 'mem=64' in record['resources_str_full']
+    assert _STALE_A100_INSTANCE_TYPE in record['resources_str_full']
 
 
 def test_list_accelerators_keeps_distinct_gpu_memory_variants():

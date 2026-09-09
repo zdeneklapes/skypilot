@@ -125,7 +125,10 @@ machine advance. "Running" at the provider layer does not imply a running job.
   instance types encode GPU model, count, per-device VRAM, CPU, and host RAM,
   so a live query can never exchange a lower-memory GPU variant for a cheaper
   one. Legacy instance types without a VRAM identity are rejected when the
-  current catalog cannot resolve a single unambiguous VRAM value.
+  current catalog cannot resolve a single unambiguous VRAM value. The encoded
+  v2 metadata also keeps a persisted handle readable after a later catalog
+  refresh omits its row; it does not make that type launchable or priced
+  without current catalog and live-offer validation.
 
 After instance readiness, SkyPilot must reach the container over SSH with the
 injected key and start its runtime (Ray and skylet); only then is the cluster

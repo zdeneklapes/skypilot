@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
+from sky import sky_logging
+from sky.adaptors import vast as vast_adaptor
 from sky.catalog import common
 from sky.utils import annotations
 from sky.utils import resources_utils
@@ -32,6 +34,7 @@ _REQUIRED_CATALOG_COLUMNS = {
 }
 
 _df = common.read_catalog('vast/vms.csv')
+logger = sky_logging.init_logger(__name__)
 
 
 @annotations.lru_cache(scope='request', maxsize=1)
@@ -87,6 +90,26 @@ def instance_type_exists(instance_type: str) -> bool:
     return common.instance_type_exists_impl(_catalog_df(), instance_type)
 
 
+def _get_missing_v2_instance_type_requirements(
+        catalog_df: pd.DataFrame,
+        instance_type: str) -> Optional[vast_adaptor.VastOfferRequirements]:
+    """Parse an absent stable v2 identity without making it launchable."""
+    if (not instance_type.startswith('vastv2-') or
+            common.instance_type_exists_impl(catalog_df, instance_type)):
+        return None
+    requirements = vast_adaptor.get_offer_requirements(
+        instance_type,
+        region=None,
+        disk_size=1,
+        datacenter_only=False,
+        reliable_hosts=False,
+        network_tier='standard',
+    )
+    logger.debug('Using embedded metadata for stale Vast v2 instance type %s',
+                 instance_type)
+    return requirements
+
+
 def validate_region_zone(
         region: Optional[str],
         zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -118,7 +141,12 @@ def get_hourly_cost(instance_type: str,
 
 def get_vcpus_mem_from_instance_type(
         instance_type: str) -> Tuple[Optional[float], Optional[float]]:
-    return common.get_vcpus_mem_from_instance_type_impl(_catalog_df(),
+    catalog_df = _catalog_df()
+    requirements = _get_missing_v2_instance_type_requirements(
+        catalog_df, instance_type)
+    if requirements is not None:
+        return requirements.cpu_cores, requirements.cpu_ram_mib / 1024
+    return common.get_vcpus_mem_from_instance_type_impl(catalog_df,
                                                         instance_type)
 
 
@@ -143,8 +171,13 @@ def get_default_instance_type(cpus: Optional[str] = None,
 
 def get_accelerators_from_instance_type(
         instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
+    catalog_df = _catalog_df()
+    requirements = _get_missing_v2_instance_type_requirements(
+        catalog_df, instance_type)
+    if requirements is not None:
+        return {requirements.gpu_name: requirements.num_gpus}
     return common.get_accelerators_from_instance_type_impl(
-        _catalog_df(), instance_type)
+        catalog_df, instance_type)
 
 
 def get_legacy_per_gpu_vram_mib(instance_type: str, num_gpus: int) -> int:
