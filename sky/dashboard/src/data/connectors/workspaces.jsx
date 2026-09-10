@@ -58,9 +58,7 @@ export async function getWorkspaces() {
 
     // Step 3: Poll the /api/get endpoint with the request_id.
     console.log(`Fetching workspace data with request_id: ${requestId}`);
-    const resultResponse = await apiClient.get(
-      `/api/get?request_id=${requestId}`
-    );
+    const resultResponse = await apiClient.getRequest(requestId);
     if (!resultResponse.ok) {
       let errorDetail = `Error fetching workspace data for request ID ${requestId}: ${resultResponse.statusText} (status ${resultResponse.status})`;
       try {
@@ -255,9 +253,7 @@ export async function getEnabledClouds(workspaceName = null, expand = false) {
 
     // Step 3: Poll the /api/get endpoint with the request_id.
     console.log(`Fetching enabled_clouds data with request_id: ${requestId}`);
-    const resultResponse = await apiClient.get(
-      `/api/get?request_id=${requestId}`
-    );
+    const resultResponse = await apiClient.getRequest(requestId);
     if (!resultResponse.ok) {
       let errorDetail = `Error fetching enabled_clouds data for request ID ${requestId}: ${resultResponse.statusText} (status ${resultResponse.status})`;
       try {
@@ -351,9 +347,7 @@ async function pollForTaskCompletion(requestId, taskName) {
     `Polling for ${taskName} task completion with request_id: ${requestId}`
   );
 
-  const resultResponse = await apiClient.get(
-    `/api/get?request_id=${requestId}`
-  );
+  const resultResponse = await apiClient.getRequest(requestId);
 
   if (!resultResponse.ok) {
     let errorDetail = `Error fetching ${taskName} data for request ID ${requestId}: ${resultResponse.statusText} (status ${resultResponse.status})`;
@@ -568,9 +562,7 @@ export async function getEnabledCloudsBatch(
       throw new Error('X-Skypilot-Request-ID header not found in response.');
     }
 
-    const resultResponse = await apiClient.get(
-      `/api/get?request_id=${requestId}`
-    );
+    const resultResponse = await apiClient.getRequest(requestId);
     if (!resultResponse.ok) {
       throw new Error(
         `Error fetching enabled_clouds_batch result for request ID ${requestId}: ${resultResponse.statusText}`

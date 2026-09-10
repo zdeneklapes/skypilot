@@ -16,7 +16,7 @@ jest.mock('@/lib/cache', () => ({
 
 jest.mock('@/data/connectors/client', () => ({
   apiClient: {
-    get: jest.fn(),
+    getRequest: jest.fn(),
     post: jest.fn(),
   },
 }));
@@ -103,7 +103,7 @@ describe('getManagedJobs sorting', () => {
       ok: true,
       headers: { get: jest.fn(() => 'request-id') },
     });
-    apiClient.get.mockResolvedValue({
+    apiClient.getRequest.mockResolvedValue({
       ok: true,
       status: 200,
       statusText: 'OK',

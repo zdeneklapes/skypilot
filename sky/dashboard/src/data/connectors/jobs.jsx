@@ -166,7 +166,7 @@ export async function getManagedJobs(options = {}) {
       const msg = 'No request ID received from server for managed jobs';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     let errorMessage = fetchedData.statusText;
     if (fetchedData.status === 500) {
       try {
@@ -358,7 +358,7 @@ export async function getPoolStatus() {
       const msg = 'No request ID received from server for getting pool status';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     let errorMessage = fetchedData.statusText;
     if (fetchedData.status === 500) {
       try {
@@ -691,11 +691,7 @@ export async function handleJobAction(action, jobId, cluster) {
         );
         return;
       }
-      const finalResponse = await apiClient.fetchImmediate(
-        `/api/get?request_id=${id}`,
-        undefined,
-        'GET'
-      );
+      const finalResponse = await apiClient.getRequest(id);
 
       // Check the status code of the final response
       if (finalResponse.status === 200) {
@@ -828,9 +824,7 @@ async function downloadLogsWithRetry(body, maxAttempts = 30) {
 
   // Step 2: long-poll /api/get, retrying on edge-timeout responses.
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const r = await fetch(
-      `${baseUrl}${ENDPOINT}/api/get?request_id=${requestId}`
-    );
+    const r = await apiClient.getRequest(requestId);
     // 524 Cloudflare timeout / 502/503/504 transient — retry against
     // the same request_id; the server's long-poll resumes waiting.
     if (

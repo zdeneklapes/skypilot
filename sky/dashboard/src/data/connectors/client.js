@@ -25,6 +25,25 @@ function withVersionHeader(headers) {
   };
 }
 
+async function normalizeRequestErrorResponse(response) {
+  if (!response.ok) return response;
+  try {
+    const payload = await response.clone().json();
+    if (payload.error != null && payload.error !== 'null') {
+      return {
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error',
+        json: async () => ({ detail: payload }),
+        text: async () => JSON.stringify({ detail: payload }),
+      };
+    }
+  } catch {
+    // A non-JSON successful response is not a request result payload.
+  }
+  return response;
+}
+
 // Cache for current user info
 let cachedUserInfo = null;
 let userInfoPromise = null;
@@ -131,7 +150,6 @@ export const apiClient = {
   fetch: async (path, body, method = 'POST') => {
     // Call the server API and get the result via /api/get, the API must return a request ID
     try {
-      const baseUrl = window.location.origin;
       const response = await apiClient.fetchImmediate(path, body, method);
 
       // Check if initial request succeeded
@@ -149,10 +167,7 @@ export const apiClient = {
         throw new Error(msg);
       }
 
-      const fetchedData = await fetch(
-        `${baseUrl}${ENDPOINT}/api/get?request_id=${id}`,
-        { headers: withVersionHeader({}) }
-      );
+      const fetchedData = await apiClient.getRequest(id);
 
       // Handle all error status codes (4xx, 5xx, etc.)
       if (!fetchedData.ok) {
@@ -215,5 +230,12 @@ export const apiClient = {
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
     return await fetch(fullUrl, { headers: withVersionHeader({}) });
+  },
+
+  getRequest: async (requestId) => {
+    const response = await apiClient.get(
+      `/api/get?request_id=${encodeURIComponent(requestId)}&return_error_payload=true`
+    );
+    return await normalizeRequestErrorResponse(response);
   },
 };

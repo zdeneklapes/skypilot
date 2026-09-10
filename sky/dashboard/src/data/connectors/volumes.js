@@ -79,7 +79,7 @@ export async function deleteVolume(volumeName, { purge = false } = {}) {
         msg: 'No request ID received from server for deleting volume',
       };
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (!fetchedData.ok) {
       const errorMessage = await getErrorMessageFromResponse(fetchedData);
       msg = `Failed to delete volume with status ${fetchedData.status}, error: ${errorMessage}`;

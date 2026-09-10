@@ -7,7 +7,7 @@ jest.mock('@/lib/cache', () => ({
 
 jest.mock('@/data/connectors/client', () => ({
   __esModule: true,
-  apiClient: { post: jest.fn(), get: jest.fn() },
+  apiClient: { post: jest.fn(), getRequest: jest.fn() },
 }));
 
 import { apiClient } from '@/data/connectors/client';
@@ -42,7 +42,7 @@ describe('getSlurmInfrastructure configured clusters', () => {
   });
 
   it('reports a configured cluster whose node and GPU queries are empty', async () => {
-    apiClient.get.mockImplementation(async (path) => {
+    apiClient.getRequest.mockImplementation(async (path) => {
       if (path.includes('req-clusters')) return result(['offline-cluster']);
       return result([]);
     });
@@ -62,7 +62,7 @@ describe('getSlurmInfrastructure configured clusters', () => {
     const clusterListPending = new Promise((resolve) => {
       releaseClusters = resolve;
     });
-    apiClient.get.mockImplementation(async (path) => {
+    apiClient.getRequest.mockImplementation(async (path) => {
       if (path.includes('req-clusters')) {
         await clusterListPending;
         return result(['cluster-a']);
@@ -76,7 +76,7 @@ describe('getSlurmInfrastructure configured clusters', () => {
     // The cluster list is still in flight, yet the other two have already got
     // past their own POST to fetching a result. Serializing them behind it
     // would leave these uncalled.
-    const fetched = apiClient.get.mock.calls.map(([path]) => path);
+    const fetched = apiClient.getRequest.mock.calls.map(([path]) => path);
     expect(fetched).toEqual(
       expect.arrayContaining([
         expect.stringContaining('req-nodes'),
@@ -89,7 +89,7 @@ describe('getSlurmInfrastructure configured clusters', () => {
   });
 
   it('falls back to an empty list when the cluster query fails', async () => {
-    apiClient.get.mockImplementation(async (path) => {
+    apiClient.getRequest.mockImplementation(async (path) => {
       if (path.includes('req-clusters')) return { ok: false, status: 500 };
       return result([]);
     });

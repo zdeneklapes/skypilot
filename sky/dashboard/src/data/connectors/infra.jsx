@@ -773,7 +773,7 @@ async function getKubernetesPerNodeGPUs(context) {
       const msg = 'No request ID received from server for kubernetes node info';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (!fetchedData.ok) {
       const errorMessage = await getErrorMessageFromResponse(fetchedData);
       const msg = `Failed to get kubernetes node info result for context ${context} with status ${fetchedData.status}, error: ${errorMessage}`;
@@ -856,7 +856,7 @@ export async function getCloudGPUs() {
       const msg = 'No request ID received from server for cloud GPUs';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (!fetchedData.ok) {
       const errorMessage = await getErrorMessageFromResponse(fetchedData);
       const msg = `Failed to get cloud GPUs result with status ${fetchedData.status}, error: ${errorMessage}`;
@@ -931,7 +931,7 @@ export async function getDetailedGpuInfo(filter) {
       const msg = 'No request ID received from server for detailed GPU info';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (!fetchedData.ok) {
       const errorMessage = await getErrorMessageFromResponse(fetchedData);
       const msg = `Failed to get detailed GPU info result with status ${fetchedData.status}, error: ${errorMessage}`;
@@ -1100,7 +1100,7 @@ async function getSlurmClusterGPUs() {
       const msg = 'No request ID received from server for slurm cluster GPUs';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (fetchedData.status === 500) {
       try {
         const data = await fetchedData.json();
@@ -1142,7 +1142,7 @@ async function getSlurmPerNodeGPUs() {
       const msg = 'No request ID received from server for slurm node info';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (fetchedData.status === 500) {
       try {
         const data = await fetchedData.json();
@@ -1194,7 +1194,7 @@ async function getSlurmClusterNames() {
       const msg = 'No request ID received from server for slurm cluster names';
       throw new Error(msg);
     }
-    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    const fetchedData = await apiClient.getRequest(id);
     if (!fetchedData.ok) {
       const msg = `Failed to get slurm cluster names result with status ${fetchedData.status}`;
       throw new Error(msg);
