@@ -1,3 +1,6 @@
+# Stage 0: Provide the Node.js toolchain used by dashboard CI.
+FROM node:23-bookworm-slim AS node-install
+
 # Stage 1: Install Google Cloud SDK using APT
 FROM python:3.10.19-slim AS gcloud-apt-install
 
@@ -17,6 +20,12 @@ FROM python:3.10.19-slim
 
 # Copy Google Cloud SDK from Stage 1
 COPY --from=gcloud-apt-install /usr/lib/google-cloud-sdk /opt/google-cloud-sdk
+
+# Copy Node.js without replacing the Python image's /usr/local tree.
+COPY --from=node-install /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-install /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Set environment variable
 ENV PATH="/opt/google-cloud-sdk/bin:$PATH"
