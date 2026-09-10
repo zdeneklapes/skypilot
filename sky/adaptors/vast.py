@@ -13,6 +13,18 @@ _COUNTRY_CODE_PATTERN = re.compile(r'^[A-Za-z]{2}$')
 _CONTINENT_CODES = frozenset({'AF', 'AN', 'AS', 'EU', 'LC', 'NA', 'OC', 'SA'})
 _MIN_RELIABILITY = 0.99
 _MIN_NETWORK_BANDWIDTH_MBPS = 1000
+_DIRECT_SEARCH_LIMIT = 10000
+_ACCELERATOR_NAME_ALIASES = {
+    'teslav100': 'V100',
+    'teslat4': 'T4',
+    'teslap100': 'P100',
+    'qrtx6000': 'RTX6000',
+    'qrtx8000': 'RTX8000',
+}
+_ACCELERATOR_MEMORY_VARIANTS = {
+    ('A100', 80 * 1024): 'A100-80GB',
+    ('V100', 32 * 1024): 'V100-32GB',
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +62,7 @@ class VastOfferRequirements:
     network_tier: str
     use_spot: bool
     max_hourly_cost: Optional[float]
+    requested_accelerator_name: Optional[str] = None
 
     @property
     def cpu_cores(self) -> Optional[float]:
@@ -147,7 +160,45 @@ def extract_country_code(region: Optional[str]) -> Optional[str]:
 
 def _normalize_gpu_name(gpu_name: Any) -> str:
     """Normalize equivalent space and underscore GPU spellings."""
-    return str(gpu_name or '').replace('_', ' ').strip().casefold()
+    return re.sub(r'[\s_]+', ' ', str(gpu_name or '')).strip().casefold()
+
+
+def _normalize_accelerator_alias(accelerator_name: Any) -> str:
+    """Normalize harmless spelling differences in accelerator aliases."""
+    return re.sub(r'[\s_]+', '', str(accelerator_name or '')).casefold()
+
+
+def canonicalize_accelerator_name(gpu_name: Any, gpu_ram_mib: int) -> str:
+    """Map a raw Vast GPU shape to its SkyPilot accelerator name."""
+    normalized_gpu = re.sub(r'[\s_]+', '', str(gpu_name or '').strip())
+    normalized_gpu = re.sub('Ada', '-Ada', normalized_gpu, flags=re.IGNORECASE)
+    normalized_gpu = re.sub(r'(Ti|PCIE|SXM4|SXM|NVL)$',
+                            '',
+                            normalized_gpu,
+                            flags=re.IGNORECASE)
+    normalized_gpu = re.sub(r'(RTX\d0\d0)(S|D)$',
+                            r'\1',
+                            normalized_gpu,
+                            flags=re.IGNORECASE)
+    normalized_gpu = _ACCELERATOR_NAME_ALIASES.get(normalized_gpu.casefold(),
+                                                   normalized_gpu)
+    normalized_alias = _normalize_accelerator_alias(normalized_gpu)
+    for (variant_gpu, variant_ram_mib), variant_name in (
+            _ACCELERATOR_MEMORY_VARIANTS.items()):
+        if (gpu_ram_mib == variant_ram_mib and
+                normalized_alias == _normalize_accelerator_alias(variant_gpu)):
+            return variant_name
+    return normalized_gpu
+
+
+def _minimum_accelerator_memory_mib(accelerator_name: str) -> int:
+    """Return the query minimum needed by a memory-specific accelerator."""
+    normalized_name = _normalize_accelerator_alias(accelerator_name)
+    for (_,
+         gpu_ram_mib), variant_name in (_ACCELERATOR_MEMORY_VARIANTS.items()):
+        if _normalize_accelerator_alias(variant_name) == normalized_name:
+            return gpu_ram_mib
+    return 1
 
 
 def _positive_finite_number(value: Any) -> Optional[float]:
@@ -350,6 +401,60 @@ def get_offer_requirements(
     )
 
 
+def get_accelerator_offer_requirements(
+        accelerator_name: str,
+        accelerator_count: Any,
+        region: Optional[str],
+        disk_size: int,
+        datacenter_only: bool,
+        reliable_hosts: bool,
+        network_tier: Any,
+        *,
+        cpus: Optional[str] = None,
+        memory: Optional[str] = None,
+        use_spot: bool = False,
+        max_hourly_cost: Optional[float] = None) -> VastOfferRequirements:
+    """Build a catalog-independent live requirement for one accelerator."""
+    normalized_name = str(accelerator_name).strip()
+    normalized_count = _positive_integral_number(accelerator_count)
+    try:
+        normalized_disk_size = int(disk_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'Invalid Vast disk size {disk_size!r}.') from exc
+    if (not normalized_name or normalized_count is None or
+            normalized_disk_size <= 0):
+        raise ValueError('Vast accelerator name, count, and disk size must be '
+                         'positive values.')
+
+    normalized_max_cost = None
+    if max_hourly_cost is not None:
+        normalized_max_cost = _positive_finite_number(max_hourly_cost)
+        if normalized_max_cost is None:
+            raise ValueError('Vast max_hourly_cost must be a positive finite '
+                             f'number, got {max_hourly_cost!r}.')
+    normalized_network_tier = str(getattr(network_tier, 'value',
+                                          network_tier)).lower()
+    if normalized_network_tier not in {'standard', 'best'}:
+        raise ValueError(
+            f'Invalid Vast network tier {network_tier!r}; expected standard '
+            'or best.')
+    return VastOfferRequirements(
+        gpu_name='',
+        num_gpus=normalized_count,
+        gpu_ram_mib=_minimum_accelerator_memory_mib(normalized_name),
+        cpu=_parse_cpu_constraint(cpus),
+        memory=_parse_memory_constraint(memory),
+        disk_size=normalized_disk_size,
+        country_code=extract_country_code(region),
+        datacenter_only=datacenter_only,
+        reliable_hosts=reliable_hosts,
+        network_tier=normalized_network_tier,
+        use_spot=use_spot,
+        max_hourly_cost=normalized_max_cost,
+        requested_accelerator_name=normalized_name,
+    )
+
+
 def build_offer_query(requirements: VastOfferRequirements) -> str:
     """Build an SDK-safe exact query equivalent to live-offer matching."""
     # Vast SDK 1.5.0 preprocesses query values with an alphanumeric parser.
@@ -363,9 +468,10 @@ def build_offer_query(requirements: VastOfferRequirements) -> str:
         'external=false',
         f'disk_space>={requirements.disk_size}',
         f'num_gpus={requirements.num_gpus}',
-        f'gpu_name={requirements.gpu_name.replace(" ", "_")}',
         f'gpu_ram>={math.ceil(requirements.gpu_ram_mib / 1024)}',
     ]
+    if requirements.requested_accelerator_name is None:
+        query.append(f'gpu_name={requirements.gpu_name.replace(" ", "_")}')
     if requirements.cpu.mode != 'unspecified':
         assert requirements.cpu.value is not None
         operator = '=' if requirements.cpu.mode == 'exact' else '>='
@@ -388,6 +494,7 @@ def build_offer_query(requirements: VastOfferRequirements) -> str:
         query.extend([
             'verified=true',
             'datacenter=true',
+            f'reliability>={_MIN_RELIABILITY}',
             f'inet_down>={_MIN_NETWORK_BANDWIDTH_MBPS}',
         ])
     if requirements.network_tier == 'best':
@@ -409,10 +516,21 @@ def _offer_rejection_reason(
     num_gpus = _positive_integral_number(offer.get('num_gpus'))
     if num_gpus is None:
         return 'malformed'
-    if (_normalize_gpu_name(offer.get('gpu_name')) != _normalize_gpu_name(
-            requirements.gpu_name) or num_gpus != requirements.num_gpus):
+    if num_gpus != requirements.num_gpus:
         return 'gpu'
     offer_gpu_ram = _positive_integral_number(offer.get('gpu_ram'))
+    if requirements.requested_accelerator_name is not None:
+        if offer_gpu_ram is None:
+            return 'vram'
+        actual_accelerator_name = canonicalize_accelerator_name(
+            offer.get('gpu_name'), offer_gpu_ram)
+        if (_normalize_accelerator_alias(actual_accelerator_name) !=
+                _normalize_accelerator_alias(
+                    requirements.requested_accelerator_name)):
+            return 'gpu'
+    elif (_normalize_gpu_name(offer.get('gpu_name')) != _normalize_gpu_name(
+            requirements.gpu_name)):
+        return 'gpu'
     if offer_gpu_ram is None or offer_gpu_ram < requirements.gpu_ram_mib:
         return 'vram'
     offer_cpu = _positive_integral_number(offer.get('cpu_cores'))
@@ -517,13 +635,16 @@ def build_instance_type_from_offer(offer: Dict[str, Any]) -> str:
 
 def _search_offer_kwargs(requirements: VastOfferRequirements) -> Dict[str, Any]:
     """Return explicit SDK arguments shared by feasibility and provisioning."""
-    return {
+    kwargs = {
         'query': build_offer_query(requirements),
         'order': 'min_bid' if requirements.use_spot else 'dph_total',
         'type': 'bid' if requirements.use_spot else 'on-demand',
         'storage': requirements.disk_size,
         'no_default': True,
     }
+    if requirements.requested_accelerator_name is not None:
+        kwargs['limit'] = _DIRECT_SEARCH_LIMIT
+    return kwargs
 
 
 def search_offers(requirements: VastOfferRequirements) -> Any:

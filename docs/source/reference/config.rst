@@ -2849,12 +2849,19 @@ SkyPilot uses the catalog only to identify compatible Vast GPU models. It
 selects a concrete offer from the live Vast marketplace immediately before
 provisioning, so catalog prices and regions are planning metadata rather than
 availability guarantees. The live offer is checked against the original task
-constraints: ``cpus: "8+"`` and ``memory: "32+"`` mean minimums, while
-``cpus: "8"`` and ``memory: "32"`` mean exact values. A memory ratio such as
-``memory: "4x"`` requires at least 4 GiB per live vCPU. Omitting CPU or memory
-does not add a CPU or RAM constraint. The selected offer's concrete CPU and
-RAM shape is then recorded for provisioning; a catalog shape never tightens
-the task's flexible constraints.
+CPU, RAM, disk, and location constraints remain the task's constraints:
+``cpus: "8+"`` and ``memory: "32+"`` mean minimums, while ``cpus: "8"`` and
+``memory: "32"`` mean exact values. A memory ratio such as ``memory: "4x"``
+requires at least 4 GiB per live vCPU. Omitting CPU or memory does not add a
+CPU or RAM constraint. The selected offer's concrete CPU and RAM shape is then
+recorded for provisioning; a catalog shape never tightens flexible task
+constraints.
+
+Catalog refresh is opportunistic: a refresh failure does not prevent live
+admission for an accelerator whose identity is already known. Malformed
+provider rows are skipped with diagnostics. A successful live query with no
+qualifying offer is reported as unavailable capacity; catalog metadata and
+provider-query failures are reported distinctly.
 
 Vast accelerator aliases first use an exact match. Otherwise SkyPilot accepts
 only an unambiguous case-insensitive match after removing spaces and

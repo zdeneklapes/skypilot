@@ -3,8 +3,10 @@
 import csv
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
+from typing import Tuple
 
 import filelock
 
@@ -31,10 +33,36 @@ _REQUIRED_COLUMNS = {
 
 logger = sky_logging.init_logger(__name__)
 
+_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r'(?i)(\b(?:api[_ -]?key|token|password|secret)\b\s*[:=]\s*)'
+    r'[^\s,;]+')
+
 
 def has_credentials() -> bool:
     """Return whether the Vast credential file permits a local refresh."""
     return Path(os.path.expanduser(_CREDENTIAL_PATH)).is_file()
+
+
+def _safe_exception_summary(exc: Exception) -> Tuple[str, str]:
+    """Return the real exception type and a credential-redacted message."""
+    message = str(exc).strip() or '<no details>'
+    try:
+        credential = Path(os.path.expanduser(_CREDENTIAL_PATH)).read_text(
+            encoding='utf-8').strip()
+    except (OSError, UnicodeError):
+        credential = ''
+    if credential:
+        message = message.replace(credential, '<redacted>')
+    message = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r'\1<redacted>', message)
+    return type(exc).__name__, message
+
+
+def _sanitized_exception_cause(exc: Exception, safe_message: str) -> Exception:
+    """Recreate an exception cause without retaining sensitive arguments."""
+    try:
+        return type(exc)(safe_message)
+    except Exception:  # pylint: disable=broad-except
+        return RuntimeError(f'{type(exc).__name__}: {safe_message}')
 
 
 def validate_catalog(path: Path) -> None:
@@ -154,7 +182,9 @@ def refresh_catalog(force: bool = False) -> bool:
                 target, records_before, records_fetched, records_after,
                 records_after - records_before)
             return True
-        except Exception:  # pylint: disable=broad-except
+        except Exception as exc:  # pylint: disable=broad-except
+            exception_type, safe_message = _safe_exception_summary(exc)
+            exception_summary = f'{exception_type}: {safe_message}'
             if target.is_file():
                 try:
                     validate_catalog(target)
@@ -164,12 +194,16 @@ def refresh_catalog(force: bool = False) -> bool:
                     if not force:
                         logger.warning(
                             'Vast catalog refresh failed; using the validated '
-                            'existing CSV: path=%s records=%d.', target,
-                            _count_catalog_records(target))
+                            'existing CSV: path=%s records=%d cause=%s.',
+                            target, _count_catalog_records(target),
+                            exception_summary)
                         return True
+            logger.warning('Vast catalog refresh failed: cause=%s.',
+                           exception_summary)
             raise RuntimeError(
-                'Vast catalog refresh failed and no valid existing catalog '
-                'is available') from None
+                'Vast catalog refresh failed; '
+                f'{exception_summary}; no valid replacement is available'
+            ) from (_sanitized_exception_cause(exc, safe_message))
         finally:
             staged.unlink(missing_ok=True)
 

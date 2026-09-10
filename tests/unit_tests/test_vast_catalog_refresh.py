@@ -59,6 +59,23 @@ def _write_catalog(path: Path,
             writer.writerow({field: row_for_index[field] for field in fields})
 
 
+def _sdk_offer(**overrides):
+    """Return one Vast SDK 1.5.0-shaped offer for catalog tests."""
+    offer = {
+        'gpu_name': 'A100',
+        'num_gpus': 1,
+        'cpu_cores': 4,
+        'cpu_ram': 8192,
+        'gpu_total_ram': 81920,
+        'dph_total': .8,
+        'min_bid': .4,
+        'geolocation': 'Prague, CZ, EU',
+        'hosting_type': 1,
+    }
+    offer.update(overrides)
+    return offer
+
+
 @pytest.fixture(autouse=True)
 def clear_request_catalog_cache():
     """Isolate request-scoped catalog snapshots between refresh tests."""
@@ -116,19 +133,7 @@ def test_datacenter_filter_fails_closed_without_hosting_type():
 def test_fetch_vast_catalog_and_save_catalog_are_reusable(
         monkeypatch, tmp_path):
     """Catalog refresh keeps raw CPU/RAM and disables SDK hidden defaults."""
-    offer = {
-        'gpu_name': 'A100',
-        'num_gpus': 1,
-        'cpu_cores': 4,
-        'cpu_ram': 8192,
-        'search': {
-            'totalHour': .8
-        },
-        'min_bid': .8,
-        'geolocation': 'any',
-        'hosting_type': 1,
-        'gpu_total_ram': 81920,
-    }
+    offer = _sdk_offer(geolocation='any')
     client = mock.Mock(spec=['search_offers'])
     client.search_offers.return_value = [offer, offer]
     monkeypatch.setattr(fetch_vast.vast, 'vast', lambda: client)
@@ -139,8 +144,59 @@ def test_fetch_vast_catalog_and_save_catalog_are_reusable(
     vast_refresh.validate_catalog(catalog_path)
     search_kwargs = client.search_offers.call_args.kwargs
     assert search_kwargs['query'] == (
-        'georegion = true inet_down >= 100 disk_space >= 80')
+        'verified=true rentable=true rented=false external=false '
+        'georegion=true inet_down>=100 disk_space>=80')
     assert search_kwargs['no_default'] is True
+    assert search_kwargs['type'] == 'on-demand'
+    assert search_kwargs['order'] == 'dph_total'
+    assert search_kwargs['storage'] == 80
+
+
+def test_fetch_vast_catalog_accepts_nullable_sdk_optional_fields(monkeypatch):
+    """Missing nullable SDK fields get conservative catalog defaults."""
+    offer = _sdk_offer(min_bid=None, geolocation=None, hosting_type=None)
+    del offer['hosting_type']
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [offer]
+    monkeypatch.setattr(fetch_vast.vast, 'vast', lambda: client)
+
+    rows = fetch_vast.fetch_vast_catalog()
+
+    assert len(rows) == 1
+    assert rows[0]['Price'] == '0.80'
+    assert rows[0]['SpotPrice'] == '0.80'
+    assert rows[0]['Region'] == 'any'
+    assert rows[0]['HostingType'] == 0
+
+
+def test_fetch_vast_catalog_skips_only_malformed_offers(monkeypatch, caplog):
+    """Malformed SDK offers are counted without discarding valid peers."""
+    offers = [
+        _sdk_offer(),
+        _sdk_offer(cpu_ram=None),
+        _sdk_offer(dph_total='not-a-price'),
+    ]
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = offers
+    monkeypatch.setattr(fetch_vast.vast, 'vast', lambda: client)
+
+    with caplog.at_level(logging.WARNING, logger=fetch_vast.__name__):
+        rows = fetch_vast.fetch_vast_catalog()
+
+    assert len(rows) == 1
+    assert 'rejected=2' in caplog.text
+    assert 'invalid_shape=1' in caplog.text
+    assert 'invalid_price=1' in caplog.text
+
+
+def test_fetch_vast_catalog_fails_when_every_offer_is_malformed(monkeypatch):
+    """A refresh fails when provider output has no usable catalog row."""
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [_sdk_offer(cpu_cores=None)]
+    monkeypatch.setattr(fetch_vast.vast, 'vast', lambda: client)
+
+    with pytest.raises(ValueError, match='no usable offers.*invalid_shape=1'):
+        fetch_vast.fetch_vast_catalog()
 
 
 def test_catalog_instance_type_uses_shared_concrete_offer_builder(monkeypatch):
@@ -161,18 +217,7 @@ def test_catalog_instance_type_uses_shared_concrete_offer_builder(monkeypatch):
 
 def test_fetch_vast_catalog_keeps_countries_distinct(monkeypatch):
     """Asian and European country rows never collapse into continent buckets."""
-    shared_offer = {
-        'gpu_name': 'A100',
-        'num_gpus': 1,
-        'cpu_cores': 4,
-        'cpu_ram': 8192,
-        'search': {
-            'totalHour': .8
-        },
-        'min_bid': .8,
-        'hosting_type': 1,
-        'gpu_total_ram': 81920,
-    }
+    shared_offer = _sdk_offer()
     offers = [{
         **shared_offer, 'geolocation': region
     } for region in ('Jiangsu, CN, AS', 'Japan, JP, AS', 'France, FR, EU')]
@@ -191,16 +236,7 @@ def test_fetch_vast_catalog_keeps_countries_distinct(monkeypatch):
 
 def test_fetch_vast_catalog_preserves_per_gpu_memory_identity(monkeypatch):
     """A100 40GB and 80GB offers must be distinct durable catalog resources."""
-    shared_offer = {
-        'gpu_name': 'A100 SXM4',
-        'cpu_cores': 32,
-        'cpu_ram': 65536,
-        'search': {
-            'totalHour': .8
-        },
-        'min_bid': .8,
-        'hosting_type': 1,
-    }
+    shared_offer = _sdk_offer(gpu_name='A100 SXM4', cpu_cores=32, cpu_ram=65536)
     offers = [{
         **shared_offer,
         'num_gpus': 1,
@@ -334,25 +370,40 @@ def test_refresh_catalog_logs_updated_record_counts(monkeypatch, tmp_path,
 
 
 def test_refresh_catalog_keeps_valid_file_on_fetch_failure(
-        monkeypatch, tmp_path):
-    """Temporary Vast failures preserve the last validated local catalog."""
+        monkeypatch, tmp_path, caplog):
+    """Refresh preserves old data and logs a redacted provider cause."""
     catalog_path = tmp_path / 'vast' / 'vms.csv'
     catalog_path.parent.mkdir()
     _write_catalog(catalog_path)
     original = catalog_path.read_text(encoding='utf-8')
+    os.utime(catalog_path, ns=(1, 1))
+    credential_path = tmp_path / 'vast_api_key'
+    credential_path.write_text('credential-secret', encoding='utf-8')
     monkeypatch.setattr(vast_refresh.catalog_common, 'get_catalog_path',
                         lambda _name: str(catalog_path))
-    monkeypatch.setattr(vast_refresh, 'has_credentials', lambda: True)
-    monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda:
-                        (_ for _ in ()).throw(RuntimeError('offline')))
+    monkeypatch.setattr(vast_refresh, '_CREDENTIAL_PATH', str(credential_path))
+    monkeypatch.setattr(
+        fetch_vast, 'fetch_vast_catalog', lambda:
+        (_ for _ in ()).throw(RuntimeError('SDK offline: credential-secret')))
 
-    assert vast_refresh.refresh_catalog()
+    refresh_logger = logging.getLogger(vast_refresh.__name__)
+    refresh_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=vast_refresh.__name__):
+            assert vast_refresh.refresh_catalog()
+    finally:
+        refresh_logger.removeHandler(caplog.handler)
+
     assert catalog_path.read_text(encoding='utf-8') == original
+    assert 'RuntimeError' in caplog.text
+    assert 'SDK offline' in caplog.text
+    assert '<redacted>' in caplog.text
+    assert 'credential-secret' not in caplog.text
 
 
 def test_forced_refresh_reports_failure_with_valid_stale_catalog(
         monkeypatch, tmp_path):
-    """A forced refresh cannot claim success when provider fetching fails."""
+    """A forced refresh preserves a sanitized provider failure as its cause."""
     catalog_path = tmp_path / 'vast' / 'vms.csv'
     catalog_path.parent.mkdir()
     _write_catalog(catalog_path)
@@ -363,9 +414,11 @@ def test_forced_refresh_reports_failure_with_valid_stale_catalog(
     monkeypatch.setattr(fetch_vast, 'fetch_vast_catalog', lambda:
                         (_ for _ in ()).throw(RuntimeError('offline')))
 
-    with pytest.raises(RuntimeError, match='no valid existing catalog'):
+    with pytest.raises(RuntimeError, match='RuntimeError: offline') as exc_info:
         vast_refresh.refresh_catalog(force=True)
     assert catalog_path.read_text(encoding='utf-8') == original
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == 'offline'
 
 
 def test_refresh_catalog_skips_without_vast_credential_file(monkeypatch):

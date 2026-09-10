@@ -327,14 +327,17 @@ small,,0,2,4,,0.1,0.1,any
 
 
 def test_vast_feasible_resources_reports_catalog_fetch_failure(monkeypatch):
+    """Default placement reports a catalog failure without hiding its cause."""
     monkeypatch.setattr(
         vast_catalog,
-        'get_instance_type_for_accelerator',
+        'get_default_instance_types',
         mock.Mock(side_effect=common.CatalogFetchError('catalog offline')),
     )
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        lambda **_kwargs: True)
 
     feasible_resources = vast_cloud.Vast()._get_feasible_launchable_resources(
-        Resources(cloud=vast_cloud.Vast(), accelerators={'A100': 1}))
+        Resources(cloud=vast_cloud.Vast(), cpus='4+'))
 
     assert feasible_resources.resources_list == []
     assert feasible_resources.hint is not None
@@ -741,6 +744,154 @@ def test_vast_feasibility_resolves_actual_offer_shape_and_price(monkeypatch):
     assert restored.resolved_cloud_offer == resolved.resolved_cloud_offer
 
 
+def test_vast_accelerator_request_bypasses_catalog_and_refresh(monkeypatch):
+    """A live accelerator request succeeds when Vast metadata is unavailable."""
+    catalog_lookup = mock.Mock(
+        side_effect=AssertionError('accelerator request used catalog'))
+    refresh_catalog = mock.Mock(
+        side_effect=AssertionError('accelerator request refreshed catalog'))
+    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
+                        catalog_lookup)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 8,
+        'cpu_ram': 32768,
+        'disk_space': 200,
+        'geolocation': 'Prague, CZ, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': .8,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  accelerators={'A100-80GB': 1},
+                  cpus='4+',
+                  memory='16+',
+                  disk_size=200,
+                  region='Czechia, CZ, EU'))
+
+    assert len(result.resources_list) == 1
+    assert result.resources_list[0].instance_type == (
+        'vastv2-1x-A100_PCIE-81920-8-32768')
+    query = client.search_offers.call_args.kwargs['query']
+    assert 'gpu_name=' not in query
+    assert 'gpu_ram>=80' in query
+    assert 'num_gpus=1' in query
+    assert 'cpu_cores>=4' in query
+    assert 'cpu_ram>=16' in query
+    assert 'disk_space>=200' in query
+    assert 'geolocation=CZ' in query
+    catalog_lookup.assert_not_called()
+    refresh_catalog.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('raw_name', 'gpu_ram_mib', 'expected_name'),
+    [('H100 PCIe', 81920, 'H100'), ('H100\tSXM', 81920, 'H100'),
+     ('H100_NVL', 95830, 'H100'), ('A100 PCIE', 81920, 'A100-80GB'),
+     ('a100 pcie', 81920, 'A100-80GB')],
+)
+def test_vast_canonicalizes_provider_gpu_variants(raw_name, gpu_ram_mib,
+                                                  expected_name):
+    """Provider suffix and whitespace variants map to stable GPU names."""
+    assert vast_adaptor.canonicalize_accelerator_name(
+        raw_name, gpu_ram_mib) == expected_name
+
+
+@pytest.mark.parametrize(
+    ('accelerator', 'expected_memory_gib'),
+    [('A100', 40.0), ('A100-80GB', 80.0)],
+)
+def test_vast_direct_request_preserves_a100_vram_variants(
+        monkeypatch, accelerator, expected_memory_gib):
+    """Direct matching keeps generic and 80GB A100 requests distinct."""
+    client = mock.Mock(spec=['search_offers'])
+    client.search_offers.return_value = [{
+        'gpu_name': 'A100 SXM4',
+        'num_gpus': 1,
+        'gpu_ram': 40960,
+        'cpu_cores': 8,
+        'cpu_ram': 32768,
+        'disk_space': 200,
+        'geolocation': 'Prague, CZ, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': .7,
+    }, {
+        'gpu_name': 'A100 PCIE',
+        'num_gpus': 1,
+        'gpu_ram': 81920,
+        'cpu_cores': 8,
+        'cpu_ram': 32768,
+        'disk_space': 200,
+        'geolocation': 'Prague, CZ, EU',
+        'rentable': True,
+        'rented': False,
+        'external': False,
+        'dph_total': .8,
+    }]
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  accelerators={accelerator: 1},
+                  cpus='4+',
+                  memory='16+',
+                  disk_size=200))
+
+    assert len(result.resources_list) == 1
+    offer = result.resources_list[0].resolved_cloud_offer
+    assert offer is not None
+    assert offer.accelerator_name == accelerator
+    assert offer.device_memory_gib == expected_memory_gib
+
+
+@pytest.mark.parametrize(
+    ('provider_result', 'expected_hint'),
+    [([], 'No live Vast offer'),
+     (RuntimeError('provider-secret'), 'live-offer query failed')],
+)
+def test_vast_direct_request_reports_live_capacity_and_provider_failures(
+        monkeypatch, provider_result, expected_hint):
+    """Direct requests distinguish no capacity from sanitized provider errors."""
+    catalog_lookup = mock.Mock(
+        side_effect=AssertionError('accelerator request used catalog'))
+    refresh_catalog = mock.Mock(
+        side_effect=AssertionError('accelerator request refreshed catalog'))
+    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
+                        catalog_lookup)
+    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
+                        refresh_catalog)
+    client = mock.Mock(spec=['search_offers'])
+    if isinstance(provider_result, Exception):
+        client.search_offers.side_effect = provider_result
+    else:
+        client.search_offers.return_value = provider_result
+    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
+
+    result = vast_cloud.Vast()._get_feasible_launchable_resources(
+        Resources(cloud=vast_cloud.Vast(),
+                  accelerators={'A100-80GB': 1},
+                  cpus='4+',
+                  memory='16+'))
+
+    assert result.resources_list == []
+    assert result.hint is not None
+    assert expected_hint.lower() in result.hint.lower()
+    assert 'provider-secret' not in result.hint
+    catalog_lookup.assert_not_called()
+    refresh_catalog.assert_not_called()
+
+
 def test_vast_spot_query_uses_bid_price_storage_and_maximum(monkeypatch):
     """Spot admission prices requested storage and enforces the live bid cap."""
     client = mock.Mock(spec=['search_offers'])
@@ -962,11 +1113,6 @@ def test_vast_default_planning_ignores_legacy_catalog_rows(monkeypatch):
 
 def test_vast_live_admission_uses_targeted_country_query(monkeypatch):
     """An explicit Vast region remains a strict live country constraint."""
-    monkeypatch.setattr(
-        vast_catalog,
-        'get_instance_type_for_accelerator',
-        lambda *_args, **_kwargs: ([_A100_INSTANCE_TYPE], []),
-    )
     client = mock.Mock(spec=['search_offers'])
     client.search_offers.return_value = [{
         'gpu_name': 'A100',
@@ -986,7 +1132,7 @@ def test_vast_live_admission_uses_targeted_country_query(monkeypatch):
     feasible_resources = vast_cloud.Vast()._get_feasible_launchable_resources(
         Resources(
             cloud=vast_cloud.Vast(),
-            accelerators={'A100': 1},
+            accelerators={'A100-80GB': 1},
             region='France, FR, EU',
             disk_size=64,
         ))
@@ -1060,11 +1206,6 @@ def test_vast_country_constraint_bypasses_catalog_locality(
 def test_vast_live_admission_uses_any_for_unscoped_marketplace_capacity(
         monkeypatch):
     """Unscoped Vast capacity may use live offers outside catalog locations."""
-    monkeypatch.setattr(
-        vast_catalog,
-        'get_instance_type_for_accelerator',
-        lambda *_args, **_kwargs: ([_A100_INSTANCE_TYPE], []),
-    )
     client = mock.Mock(spec=['search_offers'])
     client.search_offers.return_value = [{
         'gpu_name': 'A100',
@@ -1084,7 +1225,7 @@ def test_vast_live_admission_uses_any_for_unscoped_marketplace_capacity(
     feasible_resources = vast_cloud.Vast()._get_feasible_launchable_resources(
         Resources(
             cloud=vast_cloud.Vast(),
-            accelerators={'A100': 1},
+            accelerators={'A100-80GB': 1},
             disk_size=64,
         ))
 
@@ -1150,12 +1291,7 @@ def test_vast_unscoped_docker_image_survives_admission_and_deployment(
 
 
 def test_vast_live_miss_does_not_refresh_catalog(monkeypatch):
-    """A live capacity miss does not force-refresh stable GPU metadata."""
-    monkeypatch.setattr(
-        vast_catalog,
-        'get_instance_type_for_accelerator',
-        lambda *_args, **_kwargs: ([_A100_INSTANCE_TYPE], []),
-    )
+    """A direct live capacity miss never consults accelerator metadata."""
     client = mock.Mock(spec=['search_offers'])
     client.search_offers.return_value = []
     monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
@@ -1171,31 +1307,8 @@ def test_vast_live_miss_does_not_refresh_catalog(monkeypatch):
         ))
 
     assert feasible_resources.resources_list == []
-    refresh_catalog.assert_called_once_with(force=False)
+    refresh_catalog.assert_not_called()
     assert client.search_offers.call_count == 1
-
-
-def test_vast_missing_accelerator_metadata_forces_one_refresh(monkeypatch):
-    """A missing GPU identity triggers one force refresh before giving up."""
-    candidates = mock.Mock(side_effect=[(None, []), ([_A100_INSTANCE_TYPE],
-                                                     [])])
-    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
-                        candidates)
-    refresh_catalog = mock.Mock(return_value=True)
-    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
-                        refresh_catalog)
-    client = mock.Mock(spec=['search_offers'])
-    client.search_offers.return_value = []
-    monkeypatch.setattr(vast_adaptor, 'vast', lambda: client)
-
-    result = vast_cloud.Vast()._get_feasible_launchable_resources(
-        Resources(cloud=vast_cloud.Vast(), accelerators={'A100': 1}))
-
-    assert result.resources_list == []
-    assert refresh_catalog.call_args_list == [
-        mock.call(force=False), mock.call(force=True)
-    ]
-    assert candidates.call_count == 2
 
 
 def test_vast_missing_default_metadata_recovers_after_refresh(monkeypatch):
@@ -1276,33 +1389,6 @@ def test_vast_default_request_defers_constraints_to_live_marketplace(
     assert 'cpu_ram>=16' in query
     assert 'geolocation=CZ' in query
     assert result.resources_list[0].resolved_cloud_offer.hourly_price == .8
-
-
-@pytest.mark.parametrize('refresh_failure', ['exception', 'false'])
-def test_vast_failed_metadata_refresh_returns_actionable_hint(
-        monkeypatch, refresh_failure):
-    """A failed forced refresh reports safe retry guidance for missing metadata."""
-    monkeypatch.setattr(vast_catalog, 'get_instance_type_for_accelerator',
-                        lambda *_args, **_kwargs: (None, []))
-
-    def refresh_catalog(*, force):
-        if force:
-            if refresh_failure == 'exception':
-                raise RuntimeError('credential-secret')
-            return False
-        return True
-
-    monkeypatch.setattr(vast_refresh, 'refresh_catalog_for_request',
-                        refresh_catalog)
-
-    result = vast_cloud.Vast()._get_feasible_launchable_resources(
-        Resources(cloud=vast_cloud.Vast(), accelerators={'A100': 1}))
-
-    assert result.resources_list == []
-    assert result.hint is not None
-    assert 'catalog refresh' in result.hint.lower()
-    assert 'retry' in result.hint.lower()
-    assert 'credential-secret' not in result.hint
 
 
 @pytest.mark.parametrize('refresh_failure', ['exception', 'false'])
@@ -1646,6 +1732,7 @@ def test_launch_uses_reliable_filters_and_excludes_failed_machine(monkeypatch):
     for filter_expression in (
             "verified=true",
             "datacenter=true",
+            "reliability>=0.99",
             "inet_down>=1000",
     ):
         assert filter_expression in query
@@ -1716,7 +1803,7 @@ def test_live_query_survives_vast_sdk_preprocessing(monkeypatch):
     assert parsed_query["cpu_ram"]["gte"] == 8000
     assert parsed_query['rentable']['eq'] is True
     assert parsed_query['rented']['eq'] is False
-    assert "reliability" not in parsed_query
+    assert parsed_query["reliability"]["gte"] == "0.99"
     assert parsed_query["verified"]["eq"] is True
     assert parsed_query["datacenter"]["eq"] is True
     assert parsed_query["inet_up"]["gte"] == "1000"

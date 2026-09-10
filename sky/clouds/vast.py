@@ -277,8 +277,6 @@ class Vast(clouds.Cloud):
         """Returns a list of feasible resources for the given resources."""
         # pylint: disable=import-outside-toplevel
         from sky import resources as resources_lib
-        from sky.catalog import vast_catalog
-        from sky.catalog import vast_refresh
 
         if resources.resolved_cloud_offer is not None:
             return resources_utils.FeasibleResources([resources], [], None)
@@ -301,8 +299,30 @@ class Vast(clouds.Cloud):
                         resources_utils.NetworkTier.STANDARD)
 
         explicit_instance_type = resources.instance_type is not None
+        requested_accelerators = resources.accelerators
+        direct_accelerator_request = (not explicit_instance_type and
+                                      requested_accelerators is not None)
+        if direct_accelerator_request:
+            assert len(requested_accelerators) == 1, resources
+            requested_accelerator_name, requested_accelerator_count = next(
+                iter(requested_accelerators.items()))
 
         def _offer_requirements(instance_type, region):
+            if direct_accelerator_request:
+                return vast_adaptor.get_accelerator_offer_requirements(
+                    requested_accelerator_name,
+                    requested_accelerator_count,
+                    region=region,
+                    disk_size=resources.disk_size,
+                    datacenter_only=datacenter_only,
+                    reliable_hosts=reliable_hosts,
+                    network_tier=network_tier,
+                    cpus=resources.cpus,
+                    memory=resources.memory,
+                    use_spot=resources.use_spot,
+                    max_hourly_cost=resources.max_hourly_cost,
+                )
+            assert instance_type is not None
             return vast_adaptor.get_offer_requirements(
                 instance_type,
                 region=region,
@@ -324,14 +344,6 @@ class Vast(clouds.Cloud):
                     None not in resources.image_id):
                 return list(resources.image_id)
             return [None]
-
-        def _requested_accelerator_name() -> Optional[str]:
-            if explicit_instance_type:
-                return None
-            accelerators = resources.accelerators
-            if accelerators is None:
-                return None
-            return str(next(iter(accelerators)))
 
         def _admit_live_offers(instance_list, fuzzy_candidate_list):
             admitted_by_shape: Dict[Tuple[str, str, str, int, bool],
@@ -360,10 +372,15 @@ class Vast(clouds.Cloud):
                         continue
                     admitted_region = (_ANY_REGION if region is None or
                                        region == _ANY_REGION else region)
-                    canonical_accelerator = (
-                        vast_catalog.get_canonical_accelerator_name(
-                            instance_type, _requested_accelerator_name()))
                     for live_offer in live_result.offers:
+                        if direct_accelerator_request:
+                            canonical_accelerator = str(
+                                requested_accelerator_name)
+                        else:
+                            from sky.catalog import vast_catalog
+                            canonical_accelerator = (
+                                vast_catalog.get_canonical_accelerator_name(
+                                    instance_type))
                         actual_instance_type = (
                             vast_adaptor.build_instance_type_from_offer(
                                 live_offer))
@@ -435,37 +452,25 @@ class Vast(clouds.Cloud):
                 assert resources.is_launchable(), resources
                 return [resources.instance_type], []
 
-            # Currently, handle a filter on accelerators only.
-            accelerators = resources.accelerators
-            if accelerators is None:
-                # Catalog rows provide stable GPU identities only. CPU, RAM,
-                # locality, host policy, market, and price are applied live.
-                default_instance_types = (
-                    vast_catalog.get_default_instance_types(
-                        zone=resources.zone))
-                if not default_instance_types:
-                    return None, []
-                return default_instance_types, []
+            if direct_accelerator_request:
+                return [None], []
 
-            assert len(accelerators) == 1, resources
-            acc, acc_count = list(accelerators.items())[0]
-            return vast_catalog.get_instance_type_for_accelerator(
-                acc,
-                acc_count,
-                use_spot=resources.use_spot,
-                cpus=resources.cpus,
-                local_disk=resources.local_disk,
-                # Vast catalog regions identify raw localities, while
-                # resources.region is a live marketplace country constraint.
-                region=None,
-                zone=resources.zone,
-                memory=resources.memory,
-                max_hourly_cost=resources.max_hourly_cost,
-                datacenter_only=datacenter_only)
+            from sky.catalog import vast_catalog
+
+            # Catalog rows provide stable GPU identities only. CPU, RAM,
+            # locality, host policy, market, and price are applied live.
+            default_instance_types = vast_catalog.get_default_instance_types(
+                zone=resources.zone)
+            if not default_instance_types:
+                return None, []
+            return default_instance_types, []
 
         try:
             forced_refresh_failed = False
-            if not explicit_instance_type:
+            uses_catalog = (not explicit_instance_type and
+                            not direct_accelerator_request)
+            if uses_catalog:
+                from sky.catalog import vast_refresh
                 try:
                     vast_refresh.refresh_catalog_for_request(force=False)
                 except Exception:  # pylint: disable=broad-except
@@ -473,7 +478,7 @@ class Vast(clouds.Cloud):
                         'Vast catalog refresh failed before resource '
                         'lookup; using existing metadata if available.')
             instance_list, fuzzy_candidate_list = _get_catalog_candidates()
-            if not explicit_instance_type and not instance_list:
+            if uses_catalog and not instance_list:
                 try:
                     refreshed = vast_refresh.refresh_catalog_for_request(
                         force=True)
